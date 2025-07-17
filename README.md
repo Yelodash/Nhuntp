@@ -1,6 +1,6 @@
 # Nhuntp
 
-Clean Scanner using Nmap commands
+Clean Scanner using Nmap chaining.
 
 usage
 
