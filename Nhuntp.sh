@@ -1,0 +1,434 @@
+#!/bin/bash
+
+
+# Usage: ./nhuntp-scan.sh <IP>
+
+# Color definitions
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+PURPLE='\033[0;35m'
+CYAN='\033[0;36m'
+WHITE='\033[1;37m'
+GRAY='\033[0;90m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Global variables for cleanup
+SCAN_PID=""
+OUTPUT_DIR=""
+vulns=0
+
+# Function to validate IP address
+validate_ip() {
+    local ip=$1
+    local valid_ip_regex="^([0-9]{1,3}\.){3}[0-9]{1,3}$"
+    
+    if [[ ! $ip =~ $valid_ip_regex ]]; then
+        return 1
+    fi
+    
+    # Check each octet
+    IFS='.' read -ra OCTETS <<< "$ip"
+    for octet in "${OCTETS[@]}"; do
+        if (( octet > 255 )); then
+            return 1
+        fi
+    done
+    
+    return 0
+}
+
+# Cleanup function
+cleanup() {
+    echo -e "\n\n${YELLOW}[*]${NC} Cleaning up..."
+    
+    # Kill any running scan
+    if [ ! -z "$SCAN_PID" ] && kill -0 $SCAN_PID 2>/dev/null; then
+        echo -e "${YELLOW}[*]${NC} Terminating active scan..."
+        kill -TERM $SCAN_PID 2>/dev/null
+        sleep 1
+        kill -KILL $SCAN_PID 2>/dev/null
+    fi
+    
+    # Reset terminal colors
+    echo -en "${NC}"
+    
+    # Clear any partial lines
+    echo ""
+    
+    exit 0
+}
+
+# Error handler
+error_exit() {
+    echo -e "\n${RED}[!] Error: $1${NC}" >&2
+    cleanup
+    exit 1
+}
+
+# Set up signal traps
+trap cleanup EXIT
+trap 'echo -e "\n${RED}[!] Scan interrupted by user${NC}"; cleanup' INT TERM
+
+# Check if IP is provided
+if [ $# -eq 0 ]; then
+    echo -e "${RED}[!] Usage: $0 <IP>${NC}"
+    exit 1
+fi
+
+# Validate IP address
+IP=$1
+if ! validate_ip "$IP"; then
+    error_exit "Invalid IP address format: $IP"
+fi
+
+# Check if nmap is installed
+if ! command -v nmap &> /dev/null; then
+    error_exit "nmap is not installed. Please install nmap first."
+fi
+
+# Set output directory
+OUTPUT_DIR="nmap-$IP"
+
+# Check write permissions in current directory
+if [ ! -w "." ]; then
+    error_exit "No write permission in current directory"
+fi
+
+# Create output directory
+mkdir -p "$OUTPUT_DIR" 2>/dev/null || error_exit "Failed to create output directory: $OUTPUT_DIR"
+
+# Function to print section headers
+print_header() {
+    echo -e "\n${CYAN}┌─────────────────────────────────────────────────────────────┐${NC}"
+    echo -e "${CYAN}│${NC} ${WHITE}$1${NC}"
+    echo -e "${CYAN}└─────────────────────────────────────────────────────────────┘${NC}\n"
+}
+
+# Function to run scan with clean output
+run_clean_scan() {
+    local cmd=$1
+    local desc=$2
+    local scan_name=$3
+    local estimated_time=$4
+    
+    echo -e "${YELLOW}[*]${NC} ${desc}"
+    echo -e "${GRAY}    Command: $cmd${NC}"
+    
+    # Start timer
+    start_time=$(date +%s)
+    
+    # Run command in background and capture PID immediately to prevent race conditions
+    eval "$cmd > '$OUTPUT_DIR/${scan_name}.log' 2>&1" &
+    SCAN_PID=$!
+    sleep 0.2  # Brief buffer before checking
+
+    # Hardened check to ensure process actually started
+    if [ -n "$SCAN_PID" ] && ps -p "$SCAN_PID" > /dev/null 2>&1; then
+        :
+    else
+        if wait "$SCAN_PID" 2>/dev/null; then
+            :
+        else
+            exit_code=$?
+            echo -e "${RED}[!] Scan exited early with code $exit_code${NC}"
+            echo -e "${YELLOW}[*] Check log file: $OUTPUT_DIR/${scan_name}.log${NC}"
+            cleanup
+            exit 1
+        fi
+    fi
+    
+    # Show progress while scan runs
+    local elapsed=0
+    while kill -0 $SCAN_PID 2>/dev/null; do
+        local mins=$((elapsed / 60))
+        local secs=$((elapsed % 60))
+        local percent=$((elapsed * 100 / estimated_time))
+        if [ $percent -gt 100 ]; then
+            percent=99
+        fi
+        
+        printf "\r${YELLOW}[*]${NC} Scanning... ${WHITE}[%02d:%02d]${NC} ${WHITE}%3d%%${NC} " $mins $secs $percent
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    
+    # Wait for process to complete
+    wait $SCAN_PID
+    local exit_code=$?
+    
+    # Clear the line and show completion
+    printf "\r${GREEN}[✓]${NC} Completed in ${WHITE}%02d:%02d${NC}\n" $((elapsed / 60)) $((elapsed % 60))
+    
+    # Reset PID
+    SCAN_PID=""
+    
+    # Check if scan was successful
+    if [ $exit_code -ne 0 ]; then
+        echo -e "${RED}[!] Scan failed with exit code: $exit_code${NC}"
+        echo -e "${YELLOW}[*] Check log file: $OUTPUT_DIR/${scan_name}.log${NC}"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Main script
+# clear
+# echo -e "${PURPLE}"
+# echo "   ███╗   ██╗██╗  ██╗██╗   ██╗███╗   ██╗████████╗██████╗ "
+# echo ...
+# echo -e "${NC}"
+
+
+# Phase 1: Fast TCP Scan
+print_header "PHASE 1: Fast TCP Discovery (Top 1000)"
+if ! run_clean_scan "nmap -T4 -F -Pn --open -oN $OUTPUT_DIR/1-fast-scan.txt -oG $OUTPUT_DIR/.fast-scan.gnmap $IP" \
+                    "Scanning top 1000 TCP ports" \
+                    "fast-scan" 30; then
+    echo -e "${YELLOW}[*]${NC} Fast scan failed, continuing with full scan..."
+fi
+
+# Parse and display fast scan results
+if [ -f "$OUTPUT_DIR/.fast-scan.gnmap" ]; then
+    fast_ports=$(grep -oP '\d+/open' "$OUTPUT_DIR/.fast-scan.gnmap" 2>/dev/null | cut -d/ -f1 | sort -nu | paste -sd, -)
+    if [ ! -z "$fast_ports" ]; then
+        echo -e "\n${WHITE}    Discovered TCP Ports:${NC}"
+        echo -e "    ${GRAY}──────────────────────────${NC}"
+        for port in $(echo $fast_ports | tr ',' ' '); do
+            case $port in
+                21) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC} - ${YELLOW}FTP${NC}" ;;
+                22) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC} - ${GREEN}SSH${NC}" ;;
+                80) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC} - ${CYAN}HTTP${NC}" ;;
+                443) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC} - ${CYAN}HTTPS${NC}" ;;
+                445|139) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC} - ${PURPLE}SMB${NC}" ;;
+                3389) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC} - ${RED}RDP${NC}" ;;
+                *) echo -e "    ${BLUE}●${NC} Port ${WHITE}$port${NC}" ;;
+            esac
+        done
+        echo -e "\n    ${GREEN}[+]${NC} Fast scan found: ${WHITE}$fast_ports${NC}"
+    else
+        echo -e "    ${RED}No open ports found${NC}"
+    fi
+else
+    echo -e "    ${YELLOW}[!] No scan results available${NC}"
+fi
+
+# Phase 2: Full TCP Port Scan
+print_header "PHASE 2: Full TCP Port Scan (65535 ports)"
+# Using --max-rate instead of --min-rate for better control
+run_clean_scan "nmap -p- --max-rate=1000 --max-retries=1 -T4 -Pn --open -oN $OUTPUT_DIR/2-full-ports.txt -oG $OUTPUT_DIR/.full-port.gnmap $IP" \
+               "Scanning all TCP ports" \
+               "full-port" 120
+
+# Extract all open ports
+all_ports=$(grep -oP '\d+/open' "$OUTPUT_DIR/.full-port.gnmap" 2>/dev/null | cut -d/ -f1 | sort -nu | paste -sd, -)
+if [ ! -z "$all_ports" ]; then
+    # Count new ports discovered
+    if [ ! -z "$fast_ports" ]; then
+        new_ports=$(comm -13 <(echo $fast_ports | tr ',' '\n' | sort) <(echo $all_ports | tr ',' '\n' | sort) | paste -sd, -)
+        if [ ! -z "$new_ports" ]; then
+            echo -e "\n    ${GREEN}[+]${NC} Additional ports discovered: ${WHITE}$new_ports${NC}"
+        fi
+    fi
+    echo -e "    ${GREEN}[+]${NC} Total TCP ports: ${WHITE}$all_ports${NC}"
+    
+    # Save ports list
+    echo "$all_ports" > "$OUTPUT_DIR/tcp-ports.txt"
+else
+    all_ports=$fast_ports
+    echo -e "    ${YELLOW}[!]${NC} No additional ports found"
+fi
+
+# Phase 3: Service Enumeration - ENHANCED FOR FTP
+if [ ! -z "$all_ports" ]; then
+    print_header "PHASE 3: Service & Version Detection"
+    
+    # Modified service scan with better timing for FTP detection
+    # Removed -Pn to allow proper host discovery which can help with script execution
+    # Using -T3 for more reliable script execution
+    run_clean_scan "nmap -sC -sV --version-intensity 9 -T3 -p$all_ports -oN $OUTPUT_DIR/3-services.txt $IP" \
+                   "Detecting services and versions" \
+                   "services" 90
+    
+    # Display services in clean format
+    echo -e "\n${WHITE}    Service Details:${NC}"
+    echo -e "    ${GRAY}────────────────────────────────────────────────────────${NC}"
+    
+    # Parse services with better formatting
+    awk '/^[0-9]+\/tcp/ && /open/ {
+        port = $1
+        service = $3
+        version = ""
+        for(i=4; i<=NF; i++) version = version " " $i
+        printf "    Port %-6s %-15s %s\n", port, service, version
+    }' "$OUTPUT_DIR/3-services.txt" | while IFS= read -r line; do
+        if [[ $line =~ "http" ]]; then
+            echo -e "${CYAN}$line${NC}"
+        elif [[ $line =~ "ssh" ]]; then
+            echo -e "${GREEN}$line${NC}"
+        elif [[ $line =~ "ftp" ]]; then
+            echo -e "${YELLOW}$line${NC}"
+        elif [[ $line =~ "(smb|netbios|microsoft-ds)" ]]; then
+            echo -e "${PURPLE}$line${NC}"
+        elif [[ $line =~ "ms-wbt-server" ]]; then
+            echo -e "${RED}$line${NC}"
+        else
+            echo -e "${WHITE}$line${NC}"
+        fi
+    done
+    
+    # Special FTP check
+    if echo "$all_ports" | grep -qE '(^|,)21(,|$)'; then
+        echo -e "\n    ${YELLOW}[*] FTP Service Detected - Checking for anonymous access...${NC}"
+        
+        # Look for anonymous FTP in the service scan output
+        if grep -q "Anonymous FTP login allowed" "$OUTPUT_DIR/3-services.txt" 2>/dev/null; then
+            echo -e "    ${RED}[!] ANONYMOUS FTP LOGIN ALLOWED!${NC}"
+            echo -e "    ${GRAY}────────────────────────────────────────────────────────${NC}"
+            
+            # Extract FTP banner info
+            grep -A5 "ftp-anon:" "$OUTPUT_DIR/3-services.txt" 2>/dev/null | grep -E "^\|" | sed 's/^/    /'
+            
+           
+        else
+            # If not found in main scan, try a dedicated FTP scan
+            echo -e "    ${YELLOW}[*] Running dedicated FTP enumeration...${NC}"
+            nmap -p21 --script=ftp-anon,ftp-syst,ftp-bounce -T3 $IP -oN "$OUTPUT_DIR/ftp-detailed.txt" 2>/dev/null
+            
+            if grep -q "Anonymous FTP login allowed" "$OUTPUT_DIR/ftp-detailed.txt" 2>/dev/null; then
+                echo -e "    ${RED}[!] ANONYMOUS FTP LOGIN ALLOWED (found in detailed scan)!${NC}"
+                grep -A5 "ftp-anon:" "$OUTPUT_DIR/ftp-detailed.txt" 2>/dev/null | grep -E "^\|" | sed 's/^/    /'
+            else
+                echo -e "    ${GREEN}[+] Anonymous FTP login not allowed${NC}"
+            fi
+        fi
+    fi
+    
+    # Phase 4: Vulnerability Scanning
+    print_header "PHASE 4: Vulnerability Assessment"
+    # Removed -sV from vuln scan as it's redundant
+    run_clean_scan "nmap --script vuln -p$all_ports -Pn -oN $OUTPUT_DIR/4-vulns.txt $IP" \
+                   "Running vulnerability scripts" \
+                   "vuln-scan" 90
+    
+    # Check for vulnerabilities
+    vulns=$(grep -E "VULNERABLE:|State: VULNERABLE" "$OUTPUT_DIR/4-vulns.txt" 2>/dev/null | wc -l)
+    if [ $vulns -gt 0 ]; then
+        echo -e "\n    ${RED}[!] VULNERABILITIES DETECTED!${NC}"
+        echo -e "    ${GRAY}────────────────────────────────────────────────────────${NC}"
+        grep -B2 -A2 "VULNERABLE" "$OUTPUT_DIR/4-vulns.txt" | grep -E "^\|" | sed 's/^/    /' | head -20
+        echo -e "\n    ${YELLOW}[*] Check 4-vulns.txt for full details${NC}"
+    else
+        echo -e "\n    ${GREEN}[+]${NC} No obvious vulnerabilities detected"
+    fi
+    
+    # Phase 5: SMB Enumeration
+    if echo "$all_ports" | grep -qE '(445|139)'; then
+        print_header "PHASE 5: SMB Enumeration"
+        smb_ports=$(echo "$all_ports" | tr ',' '\n' | grep -E '^(445|139)$' | paste -sd, -)
+        run_clean_scan "nmap --script smb-vuln*,smb-enum-shares,smb-enum-users -p$smb_ports -Pn -oN $OUTPUT_DIR/5-smb.txt $IP" \
+                       "Enumerating SMB services" \
+                       "smb-enum" 60
+        
+        # Parse SMB results
+        if grep -q "smb-enum-shares" "$OUTPUT_DIR/5-smb.txt" 2>/dev/null; then
+            echo -e "\n    ${WHITE}SMB Shares Found:${NC}"
+            echo -e "    ${GRAY}────────────────────────────────────────────────────────${NC}"
+            grep -A20 "smb-enum-shares" "$OUTPUT_DIR/5-smb.txt" | grep -E "^\|   " | sed 's/^|/    /' | head -10
+        fi
+        
+        # SMB suggestions
+        echo -e "\n    ${YELLOW}[TIP] Next steps for SMB:${NC}"
+        echo -e "    ${GRAY}• smbclient -L //$IP${NC}"
+        echo -e "    ${GRAY}• enum4linux -a $IP${NC}"
+        echo -e "    ${GRAY}• smbmap -H $IP${NC}"
+    fi
+fi
+
+# Phase 6: UDP Scan (Top 100)
+print_header "PHASE 6: UDP Scan (Top 100)"
+
+# Check if we can use sudo
+if ! sudo -n true 2>/dev/null; then
+    echo -e "${YELLOW}[!]${NC} This scan requires sudo privileges"
+    echo -e "${YELLOW}[!]${NC} Enter sudo password or skip with Ctrl+C"
+fi
+
+# UDP scan with top 100 ports - only open ports
+if run_clean_scan "sudo nmap -sU --top-ports 100 --open -Pn -oN $OUTPUT_DIR/6-udp.txt -oG $OUTPUT_DIR/.udp.gnmap $IP 2>/dev/null || echo 'UDP scan failed'" \
+                  "Scanning top 100 UDP ports (open only)" \
+                  "udp-scan" 120; then
+    
+    # Parse UDP results - only open ports
+    if [ -f "$OUTPUT_DIR/.udp.gnmap" ]; then
+        udp_ports=$(sudo grep -oP '\d+/open' "$OUTPUT_DIR/.udp.gnmap" 2>/dev/null | cut -d/ -f1 | sort -nu | paste -sd, -)
+        if [ ! -z "$udp_ports" ]; then
+            echo -e "\n    ${GREEN}[+]${NC} Open UDP ports: ${WHITE}$udp_ports${NC}"
+            echo "$udp_ports" > "$OUTPUT_DIR/udp-ports.txt"
+            
+            # Check for important UDP services
+            if echo "$udp_ports" | grep -q "161"; then
+                echo -e "    ${YELLOW}[!]${NC} SNMP detected - try: ${GRAY}snmpwalk -c public -v1 $IP${NC}"
+            fi
+            if echo "$udp_ports" | grep -q "69"; then
+                echo -e "    ${YELLOW}[!]${NC} TFTP detected - try: ${GRAY}tftp $IP${NC}"
+            fi
+            if echo "$udp_ports" | grep -q "53"; then
+                echo -e "    ${YELLOW}[!]${NC} DNS detected - try: ${GRAY}dnsrecon -d $IP${NC}"
+            fi
+        else
+            echo -e "\n    ${YELLOW}[*]${NC} No open UDP ports found"
+        fi
+    fi
+else
+    echo -e "\n    ${YELLOW}[!]${NC} UDP scan skipped or failed (requires sudo)"
+fi
+
+# Clean up hidden files
+rm -f "$OUTPUT_DIR"/.*.gnmap 2>/dev/null
+
+# Final Summary
+print_header "SCAN COMPLETE - SUMMARY"
+echo -e "  ${WHITE}Target:${NC} $IP"
+echo -e "  ${WHITE}TCP Ports:${NC} ${GREEN}${all_ports:-None}${NC}"
+echo -e "  ${WHITE}UDP Ports:${NC} ${GREEN}${udp_ports:-None}${NC}"
+
+# Check for critical findings
+if grep -q "Anonymous FTP login allowed" "$OUTPUT_DIR"/*.txt 2>/dev/null; then
+    echo -e "\n  ${RED}[!] CRITICAL: Anonymous FTP access detected!${NC}"
+fi
+
+echo -e "\n  ${WHITE}Key Files:${NC}"
+echo -e "    ${CYAN}●${NC} tcp-ports.txt    ${GRAY}- Port list for other tools${NC}"
+echo -e "    ${CYAN}●${NC} 3-services.txt   ${GRAY}- Service versions${NC}"
+echo -e "    ${CYAN}●${NC} 4-vulns.txt      ${GRAY}- Vulnerability details${NC}"
+
+if [ $vulns -gt 0 ]; then
+    echo -e "\n  ${RED}[!] Vulnerabilities found - check 4-vulns.txt${NC}"
+fi
+
+# Create summary file
+{
+    echo "NHUNTP Scan Summary - $IP"
+    echo "========================="
+    echo "Date: $(date)"
+    echo ""
+    echo "TCP Ports: $all_ports"
+    echo "UDP Ports: ${udp_ports:-None}"
+    echo ""
+    if grep -q "Anonymous FTP login allowed" "$OUTPUT_DIR"/*.txt 2>/dev/null; then
+        echo "CRITICAL FINDING: Anonymous FTP access allowed!"
+        echo ""
+    fi
+    echo "Services:"
+    grep -E "^[0-9]+/(tcp|udp)" "$OUTPUT_DIR/3-services.txt" 2>/dev/null | head -20
+    echo ""
+    if [ $vulns -gt 0 ]; then
+        echo "VULNERABILITIES DETECTED - See 4-vulns.txt"
+    fi
+} > "$OUTPUT_DIR/summary.txt"
+
+echo -e "\n${GREEN}[✓] All scans completed! Summary: $OUTPUT_DIR/summary.txt${NC}\n"
