@@ -1,6 +1,6 @@
 # Nhuntp
 
-Clean Scanner using Nmap chaining.
+Clean output tool using Nmap, used for CTFS.
 
 usage
 
