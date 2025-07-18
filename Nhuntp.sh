@@ -1,7 +1,9 @@
 #!/bin/bash
 
 
-# Usage: sudo nhuntp.sh <IP>
+#chmod +x nhuntp-scan.sh
+#sudo nhuntp-scan.sh <10.10.10.X>
+
 
 # Color definitions
 RED='\033[0;31m'
