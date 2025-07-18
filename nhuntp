@@ -2,7 +2,7 @@
 
 
 #chmod +x nhuntp
-#sudo nhuntp <10.10.10.X>
+#sudo nhuntp <IP>
 
 
 # Color definitions
