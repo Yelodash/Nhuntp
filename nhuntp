@@ -1,8 +1,8 @@
 #!/bin/bash
 
 
-#chmod +x nhuntp-scan.sh
-#sudo nhuntp-scan.sh <10.10.10.X>
+#chmod +x nhuntp
+#sudo nhuntp <10.10.10.X>
 
 
 # Color definitions
