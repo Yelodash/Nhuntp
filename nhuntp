@@ -2,6 +2,7 @@
 
 
 #chmod +x nhuntp
+sudo cp nhuntp.sh /usr/local/bin/nhuntp
 #sudo nhuntp <IP>
 
 
