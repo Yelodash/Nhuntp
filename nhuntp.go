@@ -59,102 +59,17 @@ type Scanner struct {
 	results sync.Map
 	ctx     context.Context
 	cancel  context.CancelFunc
-	mu      sync.Mutex  // For synchronized output
+	mu      sync.Mutex // For synchronized output
+	workers map[int]*WorkerStatus // Track worker status
 }
 
-// Add host discovery function
-func (s *Scanner) discoverLiveHosts(targets []string) []string {
-	liveHosts := []string{}
-	
-	// Get local IP to exclude
-	localIP := getLocalIP()
-	
-	// Build the nmap command
-	var cmd *exec.Cmd
-	
-	// Check if we need to pass the original CIDR notation
-	if s.config.Target != "" && strings.Contains(s.config.Target, "/") {
-		// Use the original CIDR notation directly
-		cmd = exec.CommandContext(s.ctx, "nmap", "-sn", "-T4", "-n", 
-			s.config.Target, "--exclude", localIP)
-	} else {
-		// For ranges or multiple IPs, pass them as arguments
-		args := []string{"-sn", "-T4", "-n", "--exclude", localIP}
-		args = append(args, targets...)
-		cmd = exec.CommandContext(s.ctx, "nmap", args...)
-	}
-	
-	output, err := cmd.Output()
-	if err != nil {
-		fmt.Printf("%s[!] Host discovery failed: %v%s\n", ColorRed, err, ColorReset)
-		// Try without exclude
-		if s.config.Target != "" && strings.Contains(s.config.Target, "/") {
-			cmd = exec.CommandContext(s.ctx, "nmap", "-sn", "-T4", s.config.Target)
-		} else {
-			cmd = exec.CommandContext(s.ctx, "nmap", append([]string{"-sn", "-T4"}, targets...)...)
-		}
-		output, err = cmd.Output()
-		if err != nil {
-			return targets // Return all targets if discovery fails
-		}
-	}
-	
-	// Debug output
-	if s.config.Verbose {
-		fmt.Printf("%s[DEBUG] Discovery command: %s%s\n", ColorGray, strings.Join(cmd.Args, " "), ColorReset)
-	}
-	
-	// Parse output for live hosts - improved regex
-	ipRegex := regexp.MustCompile(`(?:Nmap scan report for\s+(?:[^\s]+\s+\()?(\d+\.\d+\.\d+\.\d+)\)?)|(?:Host\s+(\d+\.\d+\.\d+\.\d+)\s+is up)`)
-	matches := ipRegex.FindAllStringSubmatch(string(output), -1)
-	
-	for _, match := range matches {
-		// Check both capture groups
-		ip := match[1]
-		if ip == "" {
-			ip = match[2]
-		}
-		if ip != "" && net.ParseIP(ip) != nil {
-			liveHosts = append(liveHosts, ip)
-		}
-	}
-	
-	// Remove duplicates
-	seen := make(map[string]bool)
-	unique := []string{}
-	for _, ip := range liveHosts {
-		if !seen[ip] {
-			seen[ip] = true
-			unique = append(unique, ip)
-		}
-	}
-	
-	return unique
-}
-
-// Synchronized output functions
-func (s *Scanner) logWorker(workerID int, color, format string, args ...interface{}) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	
-	prefix := fmt.Sprintf("[Worker %d]", workerID)
-	message := fmt.Sprintf(format, args...)
-	fmt.Printf("%s%-12s %s%s%s\n", ColorGray, prefix, color, message, ColorReset)
-}
-
-func (s *Scanner) printPhaseForWorker(workerID int, phase int, title string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	
-	fmt.Printf("\n%s[Worker %d] === PHASE %d: %s ===%s\n", ColorCyan, workerID, phase, title, ColorReset)
-}
-
-func (s *Scanner) displayPortsForWorker(ports []string, workerID int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	
-	fmt.Printf("%s[Worker %d]%s     TCP Ports found: %s%s%s\n", 
-		ColorGray, workerID, ColorReset, ColorWhite, strings.Join(ports, ","), ColorReset)
+// WorkerStatus tracks each worker's progress
+type WorkerStatus struct {
+	IP          string
+	Phase       int
+	PhaseDesc   string
+	Progress    int
+	StartTime   time.Time
 }
 
 // Result stores scan results for a target
@@ -262,8 +177,15 @@ func NewScanner(config *ScanConfig, ctx context.Context) *Scanner {
 			healthy: true,
 		},
 		ctx: ctx,
+		workers: make(map[int]*WorkerStatus),
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
+	
+	// Initialize worker status
+	for i := 1; i <= config.MaxWorkers; i++ {
+		s.workers[i] = &WorkerStatus{}
+	}
+	
 	return s
 }
 
@@ -283,7 +205,8 @@ func (s *Scanner) scanTargets(targets []string) {
 			return
 		}
 		fmt.Printf("%s[+] Found %d live hosts out of %d targets%s\n", ColorGreen, len(liveTargets), len(targets), ColorReset)
-		fmt.Printf("%s[+] Live hosts: %s%s\n\n", ColorGreen, strings.Join(liveTargets, ", "), ColorReset)
+		fmt.Printf("%s[+] Live hosts: %s%s\n", ColorGreen, strings.Join(liveTargets, ", "), ColorReset)
+		fmt.Printf("\n%s═══ Starting concurrent scans ═══%s\n\n", ColorCyan, ColorReset)
 	}
 	
 	// Worker pool
@@ -344,47 +267,50 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	s.logWorker(workerID, ColorCyan, "Starting scan for %s", ip)
 	
 	// Phase 1: Fast TCP scan
-	s.printPhaseForWorker(workerID, 1, "Fast TCP Discovery (Top 1000)")
+	s.logWorker(workerID, ColorYellow, "Phase 1: Fast TCP scan on %s", ip)
 	tcpPorts := s.fastTCPScan(ip, outputDir, workerID)
 	if len(tcpPorts) > 0 {
 		result.TCPPorts = tcpPorts
-		s.displayPortsForWorker(tcpPorts, workerID)
+		s.logWorker(workerID, ColorGreen, "Found ports on %s: %s", ip, strings.Join(tcpPorts, ","))
 		
 		// Phase 2: Full port scan (if not in fast mode)
 		if !s.config.FastMode {
-			s.printPhaseForWorker(workerID, 2, "Full TCP Port Scan (65535 ports)")
+			s.logWorker(workerID, ColorYellow, "Phase 2: Full port scan on %s", ip)
 			allPorts := s.fullPortScan(ip, outputDir, workerID)
 			if len(allPorts) > len(tcpPorts) {
 				result.TCPPorts = allPorts
-				s.logWorker(workerID, ColorGreen, "Additional ports found: %s", strings.Join(allPorts[len(tcpPorts):], ","))
+				s.logWorker(workerID, ColorGreen, "Additional ports found on %s", ip)
 			}
 		}
 		
 		// Phase 3: Service enumeration
-		s.printPhaseForWorker(workerID, 3, "Service & Version Detection")
+		s.logWorker(workerID, ColorYellow, "Phase 3: Service detection on %s", ip)
 		s.serviceScan(ip, result.TCPPorts, outputDir, result, workerID)
 		
 		// Phase 4: Vulnerability scan
-		s.printPhaseForWorker(workerID, 4, "Vulnerability Assessment")
+		s.logWorker(workerID, ColorYellow, "Phase 4: Vulnerability scan on %s", ip)
 		vulns := s.vulnScan(ip, result.TCPPorts, outputDir, workerID)
 		if len(vulns) > 0 {
 			result.Vulns = vulns
-			s.logWorker(workerID, ColorRed, "VULNERABILITIES DETECTED!")
+			s.logImportant("VULNERABILITIES found on %s!", ip)
 		}
 		
 		// Phase 5: SMB enumeration if applicable
 		if s.hasSMBPorts(result.TCPPorts) {
-			s.printPhaseForWorker(workerID, 5, "SMB Enumeration")
+			s.logWorker(workerID, ColorYellow, "Phase 5: SMB enumeration on %s", ip)
 			s.smbScan(ip, outputDir, workerID)
 		}
+	} else {
+		s.logWorker(workerID, ColorYellow, "No TCP ports found on %s", ip)
 	}
 	
 	// Phase 6: UDP scan (if not skipped)
 	if !s.config.SkipUDP {
-		s.printPhaseForWorker(workerID, 6, "UDP Scan (Top 100)")
+		s.logWorker(workerID, ColorYellow, "Phase 6: UDP scan on %s", ip)
 		udpPorts := s.udpScan(ip, outputDir, workerID)
 		if len(udpPorts) > 0 {
 			result.UDPPorts = udpPorts
+			s.logWorker(workerID, ColorGreen, "UDP ports found on %s: %s", ip, strings.Join(udpPorts, ","))
 		}
 	}
 	
@@ -392,9 +318,141 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	s.results.Store(ip, result)
 	s.createSummary(ip, outputDir, result)
 	
-	s.logWorker(workerID, ColorGreen, "Completed scan for %s", ip)
+	s.logWorker(workerID, ColorGreen, "✓ Completed scan for %s", ip)
 }
 
+// Host discovery function
+func (s *Scanner) discoverLiveHosts(targets []string) []string {
+	liveHosts := []string{}
+	
+	// Get local IP to exclude
+	localIP := getLocalIP()
+	
+	// Build the nmap command
+	var cmd *exec.Cmd
+	
+	// Check if we need to pass the original CIDR notation
+	if s.config.Target != "" && strings.Contains(s.config.Target, "/") {
+		// Use the original CIDR notation directly
+		cmd = exec.CommandContext(s.ctx, "nmap", "-sn", "-T4", "-n", 
+			s.config.Target, "--exclude", localIP)
+	} else {
+		// For ranges or multiple IPs, pass them as arguments
+		args := []string{"-sn", "-T4", "-n", "--exclude", localIP}
+		args = append(args, targets...)
+		cmd = exec.CommandContext(s.ctx, "nmap", args...)
+	}
+	
+	output, err := cmd.Output()
+	if err != nil {
+		fmt.Printf("%s[!] Host discovery failed: %v%s\n", ColorRed, err, ColorReset)
+		// Try without exclude
+		if s.config.Target != "" && strings.Contains(s.config.Target, "/") {
+			cmd = exec.CommandContext(s.ctx, "nmap", "-sn", "-T4", s.config.Target)
+		} else {
+			cmd = exec.CommandContext(s.ctx, "nmap", append([]string{"-sn", "-T4"}, targets...)...)
+		}
+		output, err = cmd.Output()
+		if err != nil {
+			return targets // Return all targets if discovery fails
+		}
+	}
+	
+	// Debug output
+	if s.config.Verbose {
+		fmt.Printf("%s[DEBUG] Discovery command: %s%s\n", ColorGray, strings.Join(cmd.Args, " "), ColorReset)
+	}
+	
+	// Parse output for live hosts - improved regex
+	ipRegex := regexp.MustCompile(`(?:Nmap scan report for\s+(?:[^\s]+\s+\()?(\d+\.\d+\.\d+\.\d+)\)?)|(?:Host\s+(\d+\.\d+\.\d+\.\d+)\s+is up)`)
+	matches := ipRegex.FindAllStringSubmatch(string(output), -1)
+	
+	for _, match := range matches {
+		// Check both capture groups
+		ip := match[1]
+		if ip == "" {
+			ip = match[2]
+		}
+		if ip != "" && net.ParseIP(ip) != nil {
+			liveHosts = append(liveHosts, ip)
+		}
+	}
+	
+	// Remove duplicates
+	seen := make(map[string]bool)
+	unique := []string{}
+	for _, ip := range liveHosts {
+		if !seen[ip] {
+			seen[ip] = true
+			unique = append(unique, ip)
+		}
+	}
+	
+	return unique
+}
+
+// Status display functions
+func (s *Scanner) displayStatus() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	// Use carriage return instead of cursor movement
+	fmt.Printf("\r%s", strings.Repeat(" ", 80)) // Clear line
+	fmt.Printf("\r") // Return to start
+	
+	// Print status without complex cursor movements
+	for id := 1; id <= s.config.MaxWorkers; id++ {
+		if status, ok := s.workers[id]; ok && status.IP != "" {
+			elapsed := time.Since(status.StartTime)
+			fmt.Printf("\r%s[Worker %d]%s %-15s | Phase %d: %-20s | %3d%% | %02d:%02d\n",
+				ColorCyan, id, ColorReset,
+				status.IP,
+				status.Phase, truncate(status.PhaseDesc, 20),
+				status.Progress,
+				int(elapsed.Minutes()), int(elapsed.Seconds())%60)
+		}
+	}
+}
+
+func (s *Scanner) startStatusMonitor() {
+	// Don't use complex screen clearing
+	// Just update occasionally with important info
+}
+
+func truncate(s string, max int) string {
+	if len(s) > max {
+		return s[:max-3] + "..."
+	}
+	return s
+}
+
+// Update worker status - simplified
+func (s *Scanner) updateWorkerStatus(workerID int, ip string, phase int, phaseDesc string, progress int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	if status, ok := s.workers[workerID]; ok {
+		status.IP = ip
+		status.Phase = phase
+		status.PhaseDesc = phaseDesc
+		status.Progress = progress
+		if ip != "" && status.IP != ip {
+			status.StartTime = time.Now()
+		}
+	}
+}
+
+// Simplified output function
+func (s *Scanner) logWorker(workerID int, color, format string, args ...interface{}) {
+	message := fmt.Sprintf(format, args...)
+	fmt.Printf("%s[W%d]%s %s%s%s\n", ColorGray, workerID, ColorReset, color, message, ColorReset)
+}
+
+func (s *Scanner) logImportant(format string, args ...interface{}) {
+	fmt.Printf("\n%s[!] %s%s\n", ColorRed, fmt.Sprintf(format, args...), ColorReset)
+}
+
+// Scanning functions
 func (s *Scanner) fastTCPScan(ip, outputDir string, workerID int) []string {
 	cmd := exec.CommandContext(s.ctx, "nmap", "-T4", "-F", "-Pn", "--open",
 		"-oN", filepath.Join(outputDir, "1-fast-scan.txt"),
@@ -528,72 +586,189 @@ func (s *Scanner) udpScan(ip, outputDir string, workerID int) []string {
 	return ports
 }
 
-func (s *Scanner) runCommand(cmd *exec.Cmd, desc string, timeout int) error {
-	fmt.Printf("    %s[*]%s %s\n", ColorYellow, ColorReset, desc)
-	if s.config.Verbose {
-		fmt.Printf("    %sCommand: %s%s\n", ColorGray, strings.Join(cmd.Args, " "), ColorReset)
-	}
-	
-	// Create progress ticker
-	done := make(chan error)
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-	
-	start := time.Now()
-	
+func (s *Scanner) runCommandForWorker(cmd *exec.Cmd, desc string, timeout int, workerID int) error {
 	// Start the command
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	
-	// Run command in goroutine
+	// Create done channel
+	done := make(chan error)
 	go func() {
 		done <- cmd.Wait()
 	}()
 	
-	// Show progress
-	for {
-		select {
-		case err := <-done:
-			elapsed := time.Since(start)
-			if err != nil {
-				// Check if it was cancelled
-				if s.ctx.Err() != nil {
-					fmt.Printf("\r    %s[!]%s Cancelled after %02d:%02d\n",
-						ColorYellow, ColorReset, int(elapsed.Minutes()), int(elapsed.Seconds())%60)
-					return fmt.Errorf("scan cancelled")
-				}
-				fmt.Printf("\r    %s[!]%s Failed after %02d:%02d\n",
-					ColorRed, ColorReset, int(elapsed.Minutes()), int(elapsed.Seconds())%60)
-				return err
+	// Wait for completion or timeout
+	select {
+	case err := <-done:
+		if err != nil {
+			if s.ctx.Err() != nil {
+				return fmt.Errorf("scan cancelled")
 			}
-			fmt.Printf("\r    %s[✓]%s Completed in %02d:%02d\n",
-				ColorGreen, ColorReset, int(elapsed.Minutes()), int(elapsed.Seconds())%60)
-			return nil
-		case <-ticker.C:
-			elapsed := time.Since(start)
-			percent := int(elapsed.Seconds()) * 100 / timeout
-			if percent > 100 {
-				percent = 99
+			return err
+		}
+		return nil
+	case <-time.After(time.Duration(timeout) * time.Second):
+		cmd.Process.Kill()
+		return fmt.Errorf("scan timeout after %d seconds", timeout)
+	case <-s.ctx.Done():
+		if cmd.Process != nil {
+			cmd.Process.Kill()
+		}
+		return fmt.Errorf("scan cancelled")
+	}
+}
+
+func (s *Scanner) checkFTPForWorker(ip, outputDir string, workerID int) {
+	s.logWorker(workerID, ColorYellow, "FTP Service Detected - Checking for anonymous access...")
+	
+	// Check main service scan first
+	servicesFile := filepath.Join(outputDir, "3-services.txt")
+	if data, err := os.ReadFile(servicesFile); err == nil {
+		if strings.Contains(string(data), "Anonymous FTP login allowed") {
+			s.logWorker(workerID, ColorRed, "ANONYMOUS FTP LOGIN ALLOWED on %s!", ip)
+			return
+		}
+	}
+	
+	// Run dedicated FTP scan
+	cmd := exec.CommandContext(s.ctx, "nmap", "-p21", "--script=ftp-anon,ftp-syst,ftp-bounce",
+		"-T3", ip, "-oN", filepath.Join(outputDir, "ftp-detailed.txt"))
+	
+	if err := cmd.Run(); err == nil {
+		if data, err := os.ReadFile(filepath.Join(outputDir, "ftp-detailed.txt")); err == nil {
+			if strings.Contains(string(data), "Anonymous FTP login allowed") {
+				s.logWorker(workerID, ColorRed, "ANONYMOUS FTP LOGIN ALLOWED on %s!", ip)
+			} else {
+				s.logWorker(workerID, ColorGreen, "Anonymous FTP login not allowed on %s", ip)
 			}
-			fmt.Printf("\r    %s[*]%s Scanning... %s[%02d:%02d]%s %s%3d%%%s ",
-				ColorYellow, ColorReset, ColorWhite, int(elapsed.Minutes()), int(elapsed.Seconds())%60,
-				ColorReset, ColorWhite, percent, ColorReset)
-		case <-s.ctx.Done():
-			// Safely kill the process if it exists
-			if cmd.Process != nil {
-				cmd.Process.Kill()
-			}
-			// Clear the progress line
-			fmt.Printf("\r    %s[!]%s Cancelled                                    \n",
-				ColorYellow, ColorReset)
-			return fmt.Errorf("scan cancelled")
 		}
 	}
 }
 
-// Helper functions
+// Parsing functions
+func (s *Scanner) parsePorts(grepFile string) []string {
+	ports := []string{}
+	
+	file, err := os.Open(grepFile)
+	if err != nil {
+		return ports
+	}
+	defer file.Close()
+	
+	re := regexp.MustCompile(`(\d+)/open`)
+	scanner := bufio.NewScanner(file)
+	
+	portMap := make(map[string]bool)
+	for scanner.Scan() {
+		matches := re.FindAllStringSubmatch(scanner.Text(), -1)
+		for _, match := range matches {
+			if len(match) > 1 {
+				portMap[match[1]] = true
+			}
+		}
+	}
+	
+	for port := range portMap {
+		ports = append(ports, port)
+	}
+	
+	return ports
+}
 
+func (s *Scanner) parseServices(serviceFile string, result *Result) {
+	file, err := os.Open(serviceFile)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	
+	scanner := bufio.NewScanner(file)
+	re := regexp.MustCompile(`^(\d+)/tcp\s+open\s+(\S+)\s*(.*)`)
+	
+	for scanner.Scan() {
+		line := scanner.Text()
+		if matches := re.FindStringSubmatch(line); len(matches) > 0 {
+			port := matches[1]
+			service := matches[2]
+			version := strings.TrimSpace(matches[3])
+			
+			result.Services[port] = fmt.Sprintf("%s %s", service, version)
+		}
+	}
+}
+
+func (s *Scanner) parseVulns(vulnFile string) []string {
+	vulns := []string{}
+	
+	data, err := os.ReadFile(vulnFile)
+	if err != nil {
+		return vulns
+	}
+	
+	content := string(data)
+	if strings.Contains(content, "VULNERABLE") {
+		// Extract vulnerability information
+		lines := strings.Split(content, "\n")
+		for _, line := range lines {
+			if strings.Contains(line, "VULNERABLE") {
+				vulns = append(vulns, strings.TrimSpace(line))
+			}
+		}
+	}
+	
+	return vulns
+}
+
+// Helper functions
+func (s *Scanner) hasSMBPorts(ports []string) bool {
+	for _, port := range ports {
+		if port == "445" || port == "139" {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scanner) canUseSudo() bool {
+	cmd := exec.Command("sudo", "-n", "true")
+	return cmd.Run() == nil
+}
+
+func (s *Scanner) createSummary(ip, outputDir string, result *Result) {
+	summaryFile := filepath.Join(outputDir, "summary.txt")
+	file, err := os.Create(summaryFile)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	
+	fmt.Fprintf(file, "NHUNTP Scan Summary - %s\n", ip)
+	fmt.Fprintf(file, "=========================\n")
+	fmt.Fprintf(file, "Date: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
+	
+	fmt.Fprintf(file, "TCP Ports: %s\n", strings.Join(result.TCPPorts, ","))
+	fmt.Fprintf(file, "UDP Ports: %s\n\n", strings.Join(result.UDPPorts, ","))
+	
+	// Check for critical findings
+	for port, service := range result.Services {
+		if port == "21" && strings.Contains(service, "Anonymous") {
+			fmt.Fprintf(file, "CRITICAL FINDING: Anonymous FTP access allowed!\n\n")
+			break
+		}
+	}
+	
+	fmt.Fprintf(file, "Services:\n")
+	for port, service := range result.Services {
+		fmt.Fprintf(file, "  %s/tcp: %s\n", port, service)
+	}
+	
+	if len(result.Vulns) > 0 {
+		fmt.Fprintf(file, "\nVULNERABILITIES DETECTED - See 4-vulns.txt\n")
+	}
+}
+
+// Utility functions
 func expandTargets(target string) ([]string, error) {
 	targets := []string{}
 	
@@ -689,251 +864,6 @@ func detectGateway() string {
 		}
 	}
 	return "10.10.10.1" // Default fallback
-}
-
-func (s *Scanner) parsePorts(grepFile string) []string {
-	ports := []string{}
-	
-	file, err := os.Open(grepFile)
-	if err != nil {
-		return ports
-	}
-	defer file.Close()
-	
-	re := regexp.MustCompile(`(\d+)/open`)
-	scanner := bufio.NewScanner(file)
-	
-	portMap := make(map[string]bool)
-	for scanner.Scan() {
-		matches := re.FindAllStringSubmatch(scanner.Text(), -1)
-		for _, match := range matches {
-			if len(match) > 1 {
-				portMap[match[1]] = true
-			}
-		}
-	}
-	
-	for port := range portMap {
-		ports = append(ports, port)
-	}
-	
-	return ports
-}
-
-func (s *Scanner) parseServices(serviceFile string, result *Result) {
-	file, err := os.Open(serviceFile)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	
-	scanner := bufio.NewScanner(file)
-	re := regexp.MustCompile(`^(\d+)/tcp\s+open\s+(\S+)\s*(.*)`)
-	
-	for scanner.Scan() {
-		line := scanner.Text()
-		if matches := re.FindStringSubmatch(line); len(matches) > 0 {
-			port := matches[1]
-			service := matches[2]
-			version := strings.TrimSpace(matches[3])
-			
-			result.Services[port] = fmt.Sprintf("%s %s", service, version)
-			
-			// Display with colors
-			var color string
-			switch {
-			case strings.Contains(service, "http"):
-				color = ColorCyan
-			case strings.Contains(service, "ssh"):
-				color = ColorGreen
-			case strings.Contains(service, "ftp"):
-				color = ColorYellow
-			case strings.Contains(service, "smb") || strings.Contains(service, "netbios"):
-				color = ColorPurple
-			case strings.Contains(service, "ms-wbt-server"):
-				color = ColorRed
-			default:
-				color = ColorWhite
-			}
-			
-			fmt.Printf("    %sPort %-6s %-15s %s%s\n", color, port+"/tcp", service, version, ColorReset)
-		}
-	}
-}
-
-func (s *Scanner) parseVulns(vulnFile string) []string {
-	vulns := []string{}
-	
-	data, err := os.ReadFile(vulnFile)
-	if err != nil {
-		return vulns
-	}
-	
-	content := string(data)
-	if strings.Contains(content, "VULNERABLE") {
-		// Extract vulnerability information
-		lines := strings.Split(content, "\n")
-		for _, line := range lines {
-			if strings.Contains(line, "VULNERABLE") {
-				vulns = append(vulns, strings.TrimSpace(line))
-			}
-		}
-	}
-	
-	return vulns
-}
-
-func (s *Scanner) runCommandForWorker(cmd *exec.Cmd, desc string, timeout int, workerID int) error {
-	s.logWorker(workerID, ColorYellow, "%s", desc)
-	
-	// Start the command
-	if err := cmd.Start(); err != nil {
-		return err
-	}
-	
-	// Create done channel
-	done := make(chan error)
-	go func() {
-		done <- cmd.Wait()
-	}()
-	
-	// Wait for completion or timeout
-	select {
-	case err := <-done:
-		if err != nil {
-			if s.ctx.Err() != nil {
-				return fmt.Errorf("scan cancelled")
-			}
-			return err
-		}
-		return nil
-	case <-time.After(time.Duration(timeout) * time.Second):
-		cmd.Process.Kill()
-		return fmt.Errorf("scan timeout after %d seconds", timeout)
-	case <-s.ctx.Done():
-		if cmd.Process != nil {
-			cmd.Process.Kill()
-		}
-		return fmt.Errorf("scan cancelled")
-	}
-}
-
-func (s *Scanner) checkFTPForWorker(ip, outputDir string, workerID int) {
-	s.logWorker(workerID, ColorYellow, "FTP Service Detected - Checking for anonymous access...")
-	
-	// Check main service scan first
-	servicesFile := filepath.Join(outputDir, "3-services.txt")
-	if data, err := os.ReadFile(servicesFile); err == nil {
-		if strings.Contains(string(data), "Anonymous FTP login allowed") {
-			s.logWorker(workerID, ColorRed, "ANONYMOUS FTP LOGIN ALLOWED on %s!", ip)
-			return
-		}
-	}
-	
-	// Run dedicated FTP scan
-	cmd := exec.CommandContext(s.ctx, "nmap", "-p21", "--script=ftp-anon,ftp-syst,ftp-bounce",
-		"-T3", ip, "-oN", filepath.Join(outputDir, "ftp-detailed.txt"))
-	
-	if err := cmd.Run(); err == nil {
-		if data, err := os.ReadFile(filepath.Join(outputDir, "ftp-detailed.txt")); err == nil {
-			if strings.Contains(string(data), "Anonymous FTP login allowed") {
-				s.logWorker(workerID, ColorRed, "ANONYMOUS FTP LOGIN ALLOWED on %s!", ip)
-			} else {
-				s.logWorker(workerID, ColorGreen, "Anonymous FTP login not allowed on %s", ip)
-			}
-		}
-	}
-}
-
-func (s *Scanner) displayPorts(ports []string) {
-	fmt.Printf("\n    %sDiscovered TCP Ports:%s\n", ColorWhite, ColorReset)
-	fmt.Printf("    %s──────────────────────────%s\n", ColorGray, ColorReset)
-	
-	for _, port := range ports {
-		var service, color string
-		switch port {
-		case "21":
-			service, color = "FTP", ColorYellow
-		case "22":
-			service, color = "SSH", ColorGreen
-		case "80":
-			service, color = "HTTP", ColorCyan
-		case "443":
-			service, color = "HTTPS", ColorCyan
-		case "445", "139":
-			service, color = "SMB", ColorPurple
-		case "3389":
-			service, color = "RDP", ColorRed
-		default:
-			service, color = "", ColorBlue
-		}
-		
-		if service != "" {
-			fmt.Printf("    %s●%s Port %s%s%s - %s%s%s\n",
-				ColorBlue, ColorReset, ColorWhite, port, ColorReset, color, service, ColorReset)
-		} else {
-			fmt.Printf("    %s●%s Port %s%s%s\n",
-				ColorBlue, ColorReset, ColorWhite, port, ColorReset)
-		}
-	}
-	
-	fmt.Printf("\n    %s[+]%s Found ports: %s%s%s\n",
-		ColorGreen, ColorReset, ColorWhite, strings.Join(ports, ","), ColorReset)
-}
-
-func (s *Scanner) hasSMBPorts(ports []string) bool {
-	for _, port := range ports {
-		if port == "445" || port == "139" {
-			return true
-		}
-	}
-	return false
-}
-
-func (s *Scanner) canUseSudo() bool {
-	cmd := exec.Command("sudo", "-n", "true")
-	return cmd.Run() == nil
-}
-
-func (s *Scanner) printPhase(num int, title string) {
-	fmt.Printf("\n%s┌─────────────────────────────────────────────────────────────┐%s\n",
-		ColorCyan, ColorReset)
-	fmt.Printf("%s│%s %sPHASE %d: %s%s\n", ColorCyan, ColorReset, ColorWhite, num, title, ColorReset)
-	fmt.Printf("%s└─────────────────────────────────────────────────────────────┘%s\n\n",
-		ColorCyan, ColorReset)
-}
-
-func (s *Scanner) createSummary(ip, outputDir string, result *Result) {
-	summaryFile := filepath.Join(outputDir, "summary.txt")
-	file, err := os.Create(summaryFile)
-	if err != nil {
-		return
-	}
-	defer file.Close()
-	
-	fmt.Fprintf(file, "NHUNTP Scan Summary - %s\n", ip)
-	fmt.Fprintf(file, "=========================\n")
-	fmt.Fprintf(file, "Date: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
-	
-	fmt.Fprintf(file, "TCP Ports: %s\n", strings.Join(result.TCPPorts, ","))
-	fmt.Fprintf(file, "UDP Ports: %s\n\n", strings.Join(result.UDPPorts, ","))
-	
-	// Check for critical findings
-	for port, service := range result.Services {
-		if port == "21" && strings.Contains(service, "Anonymous") {
-			fmt.Fprintf(file, "CRITICAL FINDING: Anonymous FTP access allowed!\n\n")
-			break
-		}
-	}
-	
-	fmt.Fprintf(file, "Services:\n")
-	for port, service := range result.Services {
-		fmt.Fprintf(file, "  %s/tcp: %s\n", port, service)
-	}
-	
-	if len(result.Vulns) > 0 {
-		fmt.Fprintf(file, "\nVULNERABILITIES DETECTED - See 4-vulns.txt\n")
-	}
 }
 
 // Tunnel monitoring
