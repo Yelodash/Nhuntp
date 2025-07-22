@@ -61,6 +61,7 @@ type Scanner struct {
 	cancel  context.CancelFunc
 	mu      sync.Mutex // For synchronized output
 	workers map[int]*WorkerStatus // Track worker status
+	stats   *ScanStats
 }
 
 // WorkerStatus tracks each worker's progress
@@ -70,6 +71,13 @@ type WorkerStatus struct {
 	PhaseDesc   string
 	Progress    int
 	StartTime   time.Time
+}
+
+// ScanStats tracks overall progress
+type ScanStats struct {
+	TotalHosts   int
+	CompletedHosts int
+	mu           sync.Mutex
 }
 
 // Result stores scan results for a target
@@ -124,7 +132,7 @@ func main() {
 	
 	// Print summary
 	duration := time.Since(startTime)
-	printSummary(targets, duration)
+	printSummary(scanner, targets, duration)
 }
 
 func parseFlags() *ScanConfig {
@@ -178,6 +186,7 @@ func NewScanner(config *ScanConfig, ctx context.Context) *Scanner {
 		},
 		ctx: ctx,
 		workers: make(map[int]*WorkerStatus),
+		stats: &ScanStats{},
 	}
 	s.ctx, s.cancel = context.WithCancel(ctx)
 	
@@ -208,6 +217,9 @@ func (s *Scanner) scanTargets(targets []string) {
 		fmt.Printf("%s[+] Live hosts: %s%s\n", ColorGreen, strings.Join(liveTargets, ", "), ColorReset)
 		fmt.Printf("\n%s═══ Starting concurrent scans ═══%s\n\n", ColorCyan, ColorReset)
 	}
+	
+	// Initialize stats
+	s.stats.TotalHosts = len(liveTargets)
 	
 	// Worker pool
 	targetChan := make(chan string, len(liveTargets))
@@ -266,8 +278,21 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	
 	s.logWorker(workerID, ColorCyan, "Starting scan for %s", ip)
 	
+	// Calculate total phases for progress
+	totalPhases := 4 // Base phases
+	if !s.config.FastMode {
+		totalPhases = 5
+	}
+	if !s.config.SkipUDP {
+		totalPhases++
+	}
+	
+	currentPhase := 0
+	
 	// Phase 1: Fast TCP scan
-	s.logWorker(workerID, ColorYellow, "Phase 1: Fast TCP scan on %s", ip)
+	currentPhase++
+	progress := (currentPhase * 100) / totalPhases
+	s.logWorker(workerID, ColorYellow, "[%d%%] Phase 1: Fast TCP scan on %s", progress, ip)
 	tcpPorts := s.fastTCPScan(ip, outputDir, workerID)
 	if len(tcpPorts) > 0 {
 		result.TCPPorts = tcpPorts
@@ -275,7 +300,9 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		
 		// Phase 2: Full port scan (if not in fast mode)
 		if !s.config.FastMode {
-			s.logWorker(workerID, ColorYellow, "Phase 2: Full port scan on %s", ip)
+			currentPhase++
+			progress = (currentPhase * 100) / totalPhases
+			s.logWorker(workerID, ColorYellow, "[%d%%] Phase 2: Full port scan on %s", progress, ip)
 			allPorts := s.fullPortScan(ip, outputDir, workerID)
 			if len(allPorts) > len(tcpPorts) {
 				result.TCPPorts = allPorts
@@ -284,11 +311,15 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		}
 		
 		// Phase 3: Service enumeration
-		s.logWorker(workerID, ColorYellow, "Phase 3: Service detection on %s", ip)
+		currentPhase++
+		progress = (currentPhase * 100) / totalPhases
+		s.logWorker(workerID, ColorYellow, "[%d%%] Phase 3: Service detection on %s", progress, ip)
 		s.serviceScan(ip, result.TCPPorts, outputDir, result, workerID)
 		
 		// Phase 4: Vulnerability scan
-		s.logWorker(workerID, ColorYellow, "Phase 4: Vulnerability scan on %s", ip)
+		currentPhase++
+		progress = (currentPhase * 100) / totalPhases
+		s.logWorker(workerID, ColorYellow, "[%d%%] Phase 4: Vulnerability scan on %s", progress, ip)
 		vulns := s.vulnScan(ip, result.TCPPorts, outputDir, workerID)
 		if len(vulns) > 0 {
 			result.Vulns = vulns
@@ -297,7 +328,9 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		
 		// Phase 5: SMB enumeration if applicable
 		if s.hasSMBPorts(result.TCPPorts) {
-			s.logWorker(workerID, ColorYellow, "Phase 5: SMB enumeration on %s", ip)
+			currentPhase++
+			progress = (currentPhase * 100) / totalPhases
+			s.logWorker(workerID, ColorYellow, "[%d%%] Phase 5: SMB enumeration on %s", progress, ip)
 			s.smbScan(ip, outputDir, workerID)
 		}
 	} else {
@@ -306,7 +339,9 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	
 	// Phase 6: UDP scan (if not skipped)
 	if !s.config.SkipUDP {
-		s.logWorker(workerID, ColorYellow, "Phase 6: UDP scan on %s", ip)
+		currentPhase++
+		progress = (currentPhase * 100) / totalPhases
+		s.logWorker(workerID, ColorYellow, "[%d%%] Phase 6: UDP scan on %s", progress, ip)
 		udpPorts := s.udpScan(ip, outputDir, workerID)
 		if len(udpPorts) > 0 {
 			result.UDPPorts = udpPorts
@@ -318,7 +353,16 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	s.results.Store(ip, result)
 	s.createSummary(ip, outputDir, result)
 	
-	s.logWorker(workerID, ColorGreen, "✓ Completed scan for %s", ip)
+	// Update stats
+	s.stats.mu.Lock()
+	s.stats.CompletedHosts++
+	completed := s.stats.CompletedHosts
+	total := s.stats.TotalHosts
+	s.stats.mu.Unlock()
+	
+	overallProgress := (completed * 100) / total
+	s.logWorker(workerID, ColorGreen, "[100%%] ✓ Completed scan for %s (%d/%d hosts done - %d%% overall)", 
+		ip, completed, total, overallProgress)
 }
 
 // Host discovery function
@@ -389,57 +433,6 @@ func (s *Scanner) discoverLiveHosts(targets []string) []string {
 	}
 	
 	return unique
-}
-
-// Status display functions
-func (s *Scanner) displayStatus() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	
-	// Use carriage return instead of cursor movement
-	fmt.Printf("\r%s", strings.Repeat(" ", 80)) // Clear line
-	fmt.Printf("\r") // Return to start
-	
-	// Print status without complex cursor movements
-	for id := 1; id <= s.config.MaxWorkers; id++ {
-		if status, ok := s.workers[id]; ok && status.IP != "" {
-			elapsed := time.Since(status.StartTime)
-			fmt.Printf("\r%s[Worker %d]%s %-15s | Phase %d: %-20s | %3d%% | %02d:%02d\n",
-				ColorCyan, id, ColorReset,
-				status.IP,
-				status.Phase, truncate(status.PhaseDesc, 20),
-				status.Progress,
-				int(elapsed.Minutes()), int(elapsed.Seconds())%60)
-		}
-	}
-}
-
-func (s *Scanner) startStatusMonitor() {
-	// Don't use complex screen clearing
-	// Just update occasionally with important info
-}
-
-func truncate(s string, max int) string {
-	if len(s) > max {
-		return s[:max-3] + "..."
-	}
-	return s
-}
-
-// Update worker status - simplified
-func (s *Scanner) updateWorkerStatus(workerID int, ip string, phase int, phaseDesc string, progress int) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	
-	if status, ok := s.workers[workerID]; ok {
-		status.IP = ip
-		status.Phase = phase
-		status.PhaseDesc = phaseDesc
-		status.Progress = progress
-		if ip != "" && status.IP != ip {
-			status.StartTime = time.Now()
-		}
-	}
 }
 
 // Simplified output function
@@ -940,14 +933,42 @@ func printBanner(targetCount int) {
 	fmt.Printf("%s[*] Press Ctrl+C to stop gracefully%s\n\n", ColorCyan, ColorReset)
 }
 
-func printSummary(targets []string, duration time.Duration) {
+func printSummary(scanner *Scanner, targets []string, duration time.Duration) {
 	fmt.Printf("\n%s╔══════════════════════════════════════╗%s\n", ColorCyan, ColorReset)
 	fmt.Printf("%s║           SCAN COMPLETE              ║%s\n", ColorCyan, ColorReset)
 	fmt.Printf("%s╚══════════════════════════════════════╝%s\n\n", ColorCyan, ColorReset)
 	
 	fmt.Printf("Total Time: %s%02d:%02d%s\n", 
 		ColorWhite, int(duration.Minutes()), int(duration.Seconds())%60, ColorReset)
-	fmt.Printf("Targets Scanned: %s%d%s\n", ColorGreen, len(targets), ColorReset)
 	
-	fmt.Printf("\n%s[✓] Results saved in output directories%s\n", ColorGreen, ColorReset)
+	// Show completed hosts
+	scanner.stats.mu.Lock()
+	completed := scanner.stats.CompletedHosts
+	total := scanner.stats.TotalHosts
+	scanner.stats.mu.Unlock()
+	
+	fmt.Printf("Hosts Scanned: %s%d/%d%s\n", ColorGreen, completed, total, ColorReset)
+	
+	// Show hosts with findings
+	hostsWithPorts := 0
+	hostsWithVulns := 0
+	
+	scanner.results.Range(func(key, value interface{}) bool {
+		if result, ok := value.(*Result); ok {
+			if len(result.TCPPorts) > 0 || len(result.UDPPorts) > 0 {
+				hostsWithPorts++
+			}
+			if len(result.Vulns) > 0 {
+				hostsWithVulns++
+			}
+		}
+		return true
+	})
+	
+	fmt.Printf("Hosts with open ports: %s%d%s\n", ColorYellow, hostsWithPorts, ColorReset)
+	if hostsWithVulns > 0 {
+		fmt.Printf("Hosts with vulnerabilities: %s%d%s\n", ColorRed, hostsWithVulns, ColorReset)
+	}
+	
+	fmt.Printf("\n%s[✓] Results saved in %s%s\n", ColorGreen, scanner.config.OutputDir, ColorReset)
 }
