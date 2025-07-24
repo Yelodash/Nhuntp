@@ -51,10 +51,26 @@ type TunnelMonitor struct {
 	mu          sync.RWMutex
 }
 
+// NetworkMonitor tracks network activity per target
+type NetworkMonitor struct {
+	stats      map[string]*ConnectionStats
+	vpnIface   string
+	lastCheck  time.Time
+	mu         sync.RWMutex
+}
+
+// ConnectionStats tracks connections per IP
+type ConnectionStats struct {
+	ActiveConnections int
+	LastActivity      time.Time
+	StuckSince        *time.Time
+}
+
 // Scanner performs the actual scanning
 type Scanner struct {
 	config  *ScanConfig
 	tunnel  *TunnelMonitor
+	monitor *NetworkMonitor
 	wg      sync.WaitGroup
 	results sync.Map
 	ctx     context.Context
@@ -71,6 +87,7 @@ type WorkerStatus struct {
 	PhaseDesc   string
 	Progress    int
 	StartTime   time.Time
+	LastUpdate  time.Time
 }
 
 // ScanStats tracks overall progress
@@ -125,6 +142,12 @@ func main() {
 	if !config.FastMode && config.TunnelGW != "" {
 		go scanner.tunnel.monitor(ctx)
 	}
+	
+	// Start network monitoring
+	go scanner.monitor.run(ctx)
+	
+	// Start status updates
+	go scanner.statusUpdates(ctx)
 	
 	// Execute scans
 	startTime := time.Now()
@@ -184,6 +207,10 @@ func NewScanner(config *ScanConfig, ctx context.Context) *Scanner {
 			gateway: config.TunnelGW,
 			healthy: true,
 		},
+		monitor: &NetworkMonitor{
+			stats: make(map[string]*ConnectionStats),
+			vpnIface: detectVPNInterface(),
+		},
 		ctx: ctx,
 		workers: make(map[int]*WorkerStatus),
 		stats: &ScanStats{},
@@ -196,6 +223,154 @@ func NewScanner(config *ScanConfig, ctx context.Context) *Scanner {
 	}
 	
 	return s
+}
+
+// Network monitoring functions
+func (nm *NetworkMonitor) run(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			nm.updateStats()
+		}
+	}
+}
+
+func (nm *NetworkMonitor) updateStats() {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	
+	nm.lastCheck = time.Now()
+	
+	// Update connection stats for each monitored IP
+	for ip, stats := range nm.stats {
+		connections := getActiveConnections(ip)
+		stats.ActiveConnections = connections
+		
+		// Also check if nmap is still running
+		nmapRunning := isNmapRunning(ip)
+		
+		if connections > 0 || nmapRunning {
+			stats.LastActivity = time.Now()
+			stats.StuckSince = nil
+		} else if stats.StuckSince == nil {
+			now := time.Now()
+			stats.StuckSince = &now
+		}
+	}
+}
+
+func (nm *NetworkMonitor) startTracking(ip string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	
+	nm.stats[ip] = &ConnectionStats{
+		LastActivity: time.Now(),
+	}
+}
+
+func (nm *NetworkMonitor) stopTracking(ip string) {
+	nm.mu.Lock()
+	defer nm.mu.Unlock()
+	
+	delete(nm.stats, ip)
+}
+
+func (nm *NetworkMonitor) getStats(ip string) (int, *time.Duration) {
+	nm.mu.RLock()
+	defer nm.mu.RUnlock()
+	
+	if stats, ok := nm.stats[ip]; ok {
+		var stuckDuration *time.Duration
+		if stats.StuckSince != nil {
+			duration := time.Since(*stats.StuckSince)
+			stuckDuration = &duration
+		}
+		return stats.ActiveConnections, stuckDuration
+	}
+	return 0, nil
+}
+
+// Status update function
+func (s *Scanner) statusUpdates(ctx context.Context) {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	
+	// Track alerts to avoid spam
+	alertedHosts := make(map[string]time.Time)
+	
+	// Wait a bit before first update
+	time.Sleep(10 * time.Second)
+	
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.printStatusUpdate(alertedHosts)
+		}
+	}
+}
+
+func (s *Scanner) printStatusUpdate(alertedHosts map[string]time.Time) {
+	// Build status string
+	s.stats.mu.Lock()
+	completed := s.stats.CompletedHosts
+	total := s.stats.TotalHosts
+	s.stats.mu.Unlock()
+	
+	if total == 0 {
+		return // No scan started yet
+	}
+	
+	// Count active workers and stuck workers
+	activeWorkers := 0
+	stuckWorkers := []string{}
+	
+	for id, worker := range s.workers {
+		s.mu.Lock()
+		ip := worker.IP
+		s.mu.Unlock()
+		
+		if ip != "" {
+			activeWorkers++
+			connections, stuckDuration := s.monitor.getStats(ip)
+			
+			// Check if stuck
+			if stuckDuration != nil && *stuckDuration > 45*time.Second && connections == 0 {
+				// Only alert once per host per 5 minutes
+				if lastAlert, exists := alertedHosts[ip]; !exists || time.Since(lastAlert) > 5*time.Minute {
+					stuckWorkers = append(stuckWorkers, fmt.Sprintf("W%d(%s)", id, shortenIP(ip)))
+					alertedHosts[ip] = time.Now()
+				}
+			}
+		}
+	}
+	
+	// Build concise status line
+	status := fmt.Sprintf("%d/%d hosts | %d workers active", completed, total, activeWorkers)
+	
+	// Add VPN status
+	if s.config.TunnelGW != "" {
+		latency, loss := s.tunnel.getStats()
+		if loss > 10 || latency > 200 {
+			status += fmt.Sprintf(" | VPN:WARNING %.0fms", latency)
+		} else {
+			status += fmt.Sprintf(" | VPN:OK %.0fms", latency)
+		}
+	}
+	
+	fmt.Printf("\n%s[STATUS] %s%s\n", ColorCyan, status, ColorReset)
+	
+	// Only show stuck workers if any
+	if len(stuckWorkers) > 0 {
+		fmt.Printf("%s[STUCK] %s - no network activity detected%s\n", 
+			ColorYellow, strings.Join(stuckWorkers, ", "), ColorReset)
+	}
 }
 
 func (s *Scanner) scanTargets(targets []string) {
@@ -265,6 +440,13 @@ func (s *Scanner) worker(targets <-chan string, workerID int) {
 }
 
 func (s *Scanner) scanHost(ip string, workerID int) {
+	// Start tracking this IP
+	s.monitor.startTracking(ip)
+	defer s.monitor.stopTracking(ip)
+	
+	// Update worker status
+	s.updateWorkerStatus(workerID, ip, "starting", 0)
+	
 	outputDir := filepath.Join(s.config.OutputDir, fmt.Sprintf("nmap-%s", ip))
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		s.logWorker(workerID, ColorRed, "Failed to create directory for %s: %v", ip, err)
@@ -292,6 +474,7 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	// Phase 1: Fast TCP scan
 	currentPhase++
 	progress := (currentPhase * 100) / totalPhases
+	s.updateWorkerStatus(workerID, ip, "tcp-fast", progress)
 	s.logWorker(workerID, ColorYellow, "[%d%%] Phase 1: Fast TCP scan on %s", progress, ip)
 	tcpPorts := s.fastTCPScan(ip, outputDir, workerID)
 	if len(tcpPorts) > 0 {
@@ -302,6 +485,7 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		if !s.config.FastMode {
 			currentPhase++
 			progress = (currentPhase * 100) / totalPhases
+			s.updateWorkerStatus(workerID, ip, "tcp-full", progress)
 			s.logWorker(workerID, ColorYellow, "[%d%%] Phase 2: Full port scan on %s", progress, ip)
 			allPorts := s.fullPortScan(ip, outputDir, workerID)
 			if len(allPorts) > len(tcpPorts) {
@@ -313,12 +497,14 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		// Phase 3: Service enumeration
 		currentPhase++
 		progress = (currentPhase * 100) / totalPhases
+		s.updateWorkerStatus(workerID, ip, "service", progress)
 		s.logWorker(workerID, ColorYellow, "[%d%%] Phase 3: Service detection on %s", progress, ip)
 		s.serviceScan(ip, result.TCPPorts, outputDir, result, workerID)
 		
 		// Phase 4: Vulnerability scan
 		currentPhase++
 		progress = (currentPhase * 100) / totalPhases
+		s.updateWorkerStatus(workerID, ip, "vuln", progress)
 		s.logWorker(workerID, ColorYellow, "[%d%%] Phase 4: Vulnerability scan on %s", progress, ip)
 		vulns := s.vulnScan(ip, result.TCPPorts, outputDir, workerID)
 		if len(vulns) > 0 {
@@ -330,6 +516,7 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		if s.hasSMBPorts(result.TCPPorts) {
 			currentPhase++
 			progress = (currentPhase * 100) / totalPhases
+			s.updateWorkerStatus(workerID, ip, "smb", progress)
 			s.logWorker(workerID, ColorYellow, "[%d%%] Phase 5: SMB enumeration on %s", progress, ip)
 			s.smbScan(ip, outputDir, workerID)
 		}
@@ -341,6 +528,7 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	if !s.config.SkipUDP {
 		currentPhase++
 		progress = (currentPhase * 100) / totalPhases
+		s.updateWorkerStatus(workerID, ip, "udp", progress)
 		s.logWorker(workerID, ColorYellow, "[%d%%] Phase 6: UDP scan on %s", progress, ip)
 		udpPorts := s.udpScan(ip, outputDir, workerID)
 		if len(udpPorts) > 0 {
@@ -360,9 +548,28 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	total := s.stats.TotalHosts
 	s.stats.mu.Unlock()
 	
+	// Clear worker status
+	s.updateWorkerStatus(workerID, "", "", 0)
+	
 	overallProgress := (completed * 100) / total
 	s.logWorker(workerID, ColorGreen, "[100%%] ✓ Completed scan for %s (%d/%d hosts done - %d%% overall)", 
 		ip, completed, total, overallProgress)
+}
+
+// Update worker status
+func (s *Scanner) updateWorkerStatus(workerID int, ip, phase string, progress int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	if worker, ok := s.workers[workerID]; ok {
+		worker.IP = ip
+		worker.PhaseDesc = phase
+		worker.Progress = progress
+		worker.LastUpdate = time.Now()
+		if ip != "" && worker.StartTime.IsZero() {
+			worker.StartTime = time.Now()
+		}
+	}
 }
 
 // Host discovery function
@@ -857,6 +1064,85 @@ func detectGateway() string {
 		}
 	}
 	return "10.10.10.1" // Default fallback
+}
+
+func detectVPNInterface() string {
+	// Common VPN interface names
+	vpnInterfaces := []string{"tun0", "tap0", "ppp0", "vpn0"}
+	
+	for _, iface := range vpnInterfaces {
+		if _, err := net.InterfaceByName(iface); err == nil {
+			return iface
+		}
+	}
+	
+	return "tun0" // Default
+}
+
+// Network monitoring helper functions
+func getActiveConnections(ip string) int {
+	// Use ss to count established connections to the target IP
+	cmd := exec.Command("ss", "-tn", "state", "established", 
+		fmt.Sprintf("dst %s", ip))
+	
+	output, err := cmd.Output()
+	if err != nil {
+		return 0
+	}
+	
+	// Count lines (excluding header)
+	lines := strings.Split(string(output), "\n")
+	count := 0
+	for _, line := range lines {
+		if strings.TrimSpace(line) != "" && strings.Contains(line, ip) {
+			count++
+		}
+	}
+	
+	return count
+}
+
+// Check if nmap process is still running for this target
+func isNmapRunning(targetIP string) bool {
+	cmd := exec.Command("pgrep", "-f", fmt.Sprintf("nmap.*%s", targetIP))
+	output, _ := cmd.Output()
+	return len(strings.TrimSpace(string(output))) > 0
+}
+
+func shortenIP(ip string) string {
+	// Shorten IP for display (10.10.10.5 -> 10.5)
+	parts := strings.Split(ip, ".")
+	if len(parts) == 4 {
+		// If in same subnet, just show last octet
+		if strings.HasPrefix(ip, "10.10.10.") {
+			return "10." + parts[3]
+		} else if strings.HasPrefix(ip, "192.168.") {
+			return parts[2] + "." + parts[3]
+		}
+	}
+	return ip
+}
+
+func shortPhase(phase string) string {
+	// Shorten phase names for display
+	switch phase {
+	case "tcp-fast":
+		return "tcp"
+	case "tcp-full":
+		return "full"
+	case "service":
+		return "svc"
+	case "vuln":
+		return "vln"
+	case "smb":
+		return "smb"
+	case "udp":
+		return "udp"
+	case "starting":
+		return "init"
+	default:
+		return phase
+	}
 }
 
 // Tunnel monitoring
