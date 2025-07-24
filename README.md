@@ -41,7 +41,7 @@ output_dir/
 │   ├── 2-full-ports.txt
 │   ├── 3-services.txt
 │   ├── 4-vulns.txt
-│   ├── 5-smb.txt
+│   ├── 5-smb.txt (if open)
 │   ├── 6-udp.txt
 │   └── summary.txt
 └── nmap-10.10.10.8/
