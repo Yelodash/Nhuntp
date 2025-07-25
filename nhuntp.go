@@ -471,7 +471,7 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	
 	currentPhase := 0
 	
-	// Phase 1: Fast TCP scan
+	// Phase 1: Fast TCP scan with basic scripts
 	currentPhase++
 	progress := (currentPhase * 100) / totalPhases
 	s.updateWorkerStatus(workerID, ip, "tcp-fast", progress)
@@ -490,7 +490,10 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 			allPorts := s.fullPortScan(ip, outputDir, workerID)
 			if len(allPorts) > len(tcpPorts) {
 				result.TCPPorts = allPorts
-				s.logWorker(workerID, ColorGreen, "Additional ports found on %s", ip)
+				s.logWorker(workerID, ColorGreen, "Additional ports found on %s: %s", ip, 
+					strings.Join(getDifference(allPorts, tcpPorts), ","))
+			} else {
+				s.logWorker(workerID, ColorYellow, "No additional ports found on %s during full scan", ip)
 			}
 		}
 		
@@ -510,6 +513,8 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		if len(vulns) > 0 {
 			result.Vulns = vulns
 			s.logImportant("VULNERABILITIES found on %s!", ip)
+		} else {
+			s.logWorker(workerID, ColorYellow, "No vulnerabilities detected on %s", ip)
 		}
 		
 		// Phase 5: SMB enumeration if applicable
@@ -534,6 +539,8 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 		if len(udpPorts) > 0 {
 			result.UDPPorts = udpPorts
 			s.logWorker(workerID, ColorGreen, "UDP ports found on %s: %s", ip, strings.Join(udpPorts, ","))
+		} else {
+			s.logWorker(workerID, ColorYellow, "No UDP ports found on %s", ip)
 		}
 	}
 	
@@ -552,7 +559,7 @@ func (s *Scanner) scanHost(ip string, workerID int) {
 	s.updateWorkerStatus(workerID, "", "", 0)
 	
 	overallProgress := (completed * 100) / total
-	s.logWorker(workerID, ColorGreen, "[100%%] ✓ Completed scan for %s (%d/%d hosts done - %d%% overall)", 
+	s.logWorker(workerID, ColorGreen, "[100%%] Completed scan for %s (%d/%d hosts done - %d%% overall)", 
 		ip, completed, total, overallProgress)
 }
 
@@ -652,29 +659,41 @@ func (s *Scanner) logImportant(format string, args ...interface{}) {
 	fmt.Printf("\n%s[!] %s%s\n", ColorRed, fmt.Sprintf(format, args...), ColorReset)
 }
 
-// Scanning functions
+// Scanning functions with better error handling
 func (s *Scanner) fastTCPScan(ip, outputDir string, workerID int) []string {
-	cmd := exec.CommandContext(s.ctx, "nmap", "-T4", "-F", "-Pn", "--open",
+	cmd := exec.CommandContext(s.ctx, "nmap", "-T4", "-F", "-sC", "-Pn", "--open",
 		"-oN", filepath.Join(outputDir, "1-fast-scan.txt"),
 		"-oG", filepath.Join(outputDir, ".fast-scan.gnmap"),
 		ip)
 	
-	if err := s.runCommandForWorker(cmd, "Scanning top 1000 TCP ports", 30, workerID); err != nil {
+	if err := s.runCommandForWorker(cmd, "Scanning top 1000 TCP ports", 60, workerID); err != nil {
+		s.logWorker(workerID, ColorRed, "Fast TCP scan failed for %s: %v", ip, err)
 		return nil
+	}
+	
+	// Verify output file exists and is complete
+	if !s.verifyScanCompletion(filepath.Join(outputDir, "1-fast-scan.txt")) {
+		s.logWorker(workerID, ColorYellow, "Fast TCP scan incomplete for %s", ip)
 	}
 	
 	return s.parsePorts(filepath.Join(outputDir, ".fast-scan.gnmap"))
 }
 
 func (s *Scanner) fullPortScan(ip, outputDir string, workerID int) []string {
-	cmd := exec.CommandContext(s.ctx, "nmap", "-p-", "--max-rate=1000", "--max-retries=1",
+	cmd := exec.CommandContext(s.ctx, "nmap", "-p-", "--min-rate=2000", "--max-retries=1",
 		"-T4", "-Pn", "--open",
 		"-oN", filepath.Join(outputDir, "2-full-ports.txt"),
 		"-oG", filepath.Join(outputDir, ".full-port.gnmap"),
 		ip)
 	
-	if err := s.runCommandForWorker(cmd, "Scanning all TCP ports", 120, workerID); err != nil {
+	if err := s.runCommandForWorker(cmd, "Scanning all TCP ports", 300, workerID); err != nil {
+		s.logWorker(workerID, ColorRed, "Full port scan failed for %s: %v", ip, err)
 		return nil
+	}
+	
+	// Verify output file exists and is complete
+	if !s.verifyScanCompletion(filepath.Join(outputDir, "2-full-ports.txt")) {
+		s.logWorker(workerID, ColorYellow, "Full port scan incomplete for %s", ip)
 	}
 	
 	return s.parsePorts(filepath.Join(outputDir, ".full-port.gnmap"))
@@ -686,17 +705,61 @@ func (s *Scanner) serviceScan(ip string, ports []string, outputDir string, resul
 	}
 	
 	portList := strings.Join(ports, ",")
-	cmd := exec.CommandContext(s.ctx, "nmap", "-sC", "-sV", "--version-intensity", "9",
-		"-T3", fmt.Sprintf("-p%s", portList),
+	// Increase timeout based on number of ports - more generous for services
+	timeout := 120 + (len(ports) * 20)
+	if timeout > 600 {
+		timeout = 600
+	}
+	
+	// Add --reason to understand why ports show as open
+	cmd := exec.CommandContext(s.ctx, "nmap", "-sC", "-sV", "--version-intensity", "7",
+		"-T4", "--reason", fmt.Sprintf("-p%s", portList),
 		"-oN", filepath.Join(outputDir, "3-services.txt"),
+		"-oX", filepath.Join(outputDir, "3-services.xml"),
 		ip)
 	
-	if err := s.runCommandForWorker(cmd, "Detecting services and versions", 90, workerID); err != nil {
+	if err := s.runCommandForWorker(cmd, "Detecting services and versions", timeout, workerID); err != nil {
+		s.logWorker(workerID, ColorRed, "Service scan failed for %s: %v", ip, err)
+		// Try a simpler scan as fallback
+		s.logWorker(workerID, ColorYellow, "Attempting basic service detection as fallback...")
+		cmd = exec.CommandContext(s.ctx, "nmap", "-sV", fmt.Sprintf("-p%s", portList),
+			"-oN", filepath.Join(outputDir, "3-services-basic.txt"), ip)
+		s.runCommandForWorker(cmd, "Basic service detection", 60, workerID)
 		return
 	}
 	
-	// Parse services
+	// Wait a moment for file to be fully written
+	time.Sleep(500 * time.Millisecond)
+	
+	// Verify output file exists and is complete
+	if !s.verifyScanCompletion(filepath.Join(outputDir, "3-services.txt")) {
+		s.logWorker(workerID, ColorYellow, "Service scan incomplete for %s", ip)
+	}
+	
+	// Parse services - try multiple approaches
 	s.parseServices(filepath.Join(outputDir, "3-services.txt"), result)
+	
+	// If no services found, try parsing XML output
+	if len(result.Services) == 0 {
+		s.logWorker(workerID, ColorYellow, "No services parsed from text output, checking detailed scan...")
+		// Re-read the file and look for any service info
+		if data, err := os.ReadFile(filepath.Join(outputDir, "3-services.txt")); err == nil {
+			s.parseServicesVerbose(string(data), result, ports)
+		}
+	}
+	
+	// Log services found
+	if len(result.Services) > 0 {
+		s.logWorker(workerID, ColorGreen, "Identified %d services on %s", len(result.Services), ip)
+		// Show clean service info
+		for port, service := range result.Services {
+			// Clean up the service string for display
+			cleanService := s.cleanServiceString(service)
+			s.logWorker(workerID, ColorCyan, "  Port %s: %s", port, cleanService)
+		}
+	} else {
+		s.logWorker(workerID, ColorYellow, "WARNING: No services identified on %s (but ports are open)", ip)
+	}
 	
 	// Check for anonymous FTP
 	for _, port := range ports {
@@ -713,13 +776,28 @@ func (s *Scanner) vulnScan(ip string, ports []string, outputDir string, workerID
 	}
 	
 	portList := strings.Join(ports, ",")
+	// Increase timeout for vuln scans
+	timeout := 120 + (len(ports) * 15)
+	if timeout > 600 {
+		timeout = 600
+	}
+	
 	cmd := exec.CommandContext(s.ctx, "nmap", "--script", "vuln",
 		fmt.Sprintf("-p%s", portList), "-Pn",
 		"-oN", filepath.Join(outputDir, "4-vulns.txt"),
 		ip)
 	
-	if err := s.runCommandForWorker(cmd, "Running vulnerability scripts", 90, workerID); err != nil {
+	if err := s.runCommandForWorker(cmd, "Running vulnerability scripts", timeout, workerID); err != nil {
+		s.logWorker(workerID, ColorRed, "Vulnerability scan failed for %s: %v", ip, err)
+		// Create empty file to indicate scan was attempted
+		os.WriteFile(filepath.Join(outputDir, "4-vulns.txt"), 
+			[]byte(fmt.Sprintf("# Vulnerability scan failed for %s\n# Error: %v\n", ip, err)), 0644)
 		return nil
+	}
+	
+	// Verify output file exists and is complete
+	if !s.verifyScanCompletion(filepath.Join(outputDir, "4-vulns.txt")) {
+		s.logWorker(workerID, ColorYellow, "Vulnerability scan incomplete for %s", ip)
 	}
 	
 	return s.parseVulns(filepath.Join(outputDir, "4-vulns.txt"))
@@ -747,7 +825,15 @@ func (s *Scanner) smbScan(ip, outputDir string, workerID int) {
 		"-oN", filepath.Join(outputDir, "5-smb.txt"),
 		ip)
 	
-	s.runCommandForWorker(cmd, "Enumerating SMB services", 60, workerID)
+	if err := s.runCommandForWorker(cmd, "Enumerating SMB services", 120, workerID); err != nil {
+		s.logWorker(workerID, ColorRed, "SMB scan failed for %s: %v", ip, err)
+		return
+	}
+	
+	// Verify output file exists and is complete
+	if !s.verifyScanCompletion(filepath.Join(outputDir, "5-smb.txt")) {
+		s.logWorker(workerID, ColorYellow, "SMB scan incomplete for %s", ip)
+	}
 	
 	s.logWorker(workerID, ColorYellow, "[TIP] SMB next steps: smbclient -L //%s | enum4linux -a %s", ip, ip)
 }
@@ -755,7 +841,10 @@ func (s *Scanner) smbScan(ip, outputDir string, workerID int) {
 func (s *Scanner) udpScan(ip, outputDir string, workerID int) []string {
 	// Check if we can use sudo
 	if !s.canUseSudo() {
-		s.logWorker(workerID, ColorYellow, "UDP scan requires sudo privileges")
+		s.logWorker(workerID, ColorYellow, "UDP scan requires sudo privileges - skipping")
+		// Create file indicating UDP scan was skipped
+		os.WriteFile(filepath.Join(outputDir, "6-udp.txt"), 
+			[]byte(fmt.Sprintf("# UDP scan skipped for %s - requires sudo privileges\n", ip)), 0644)
 		return nil
 	}
 	
@@ -765,8 +854,17 @@ func (s *Scanner) udpScan(ip, outputDir string, workerID int) []string {
 		"-oG", filepath.Join(outputDir, ".udp.gnmap"),
 		ip)
 	
-	if err := s.runCommandForWorker(cmd, "Scanning top 100 UDP ports", 120, workerID); err != nil {
+	if err := s.runCommandForWorker(cmd, "Scanning top 100 UDP ports", 180, workerID); err != nil {
+		s.logWorker(workerID, ColorRed, "UDP scan failed for %s: %v", ip, err)
+		// Create file indicating UDP scan failed
+		os.WriteFile(filepath.Join(outputDir, "6-udp.txt"), 
+			[]byte(fmt.Sprintf("# UDP scan failed for %s\n# Error: %v\n", ip, err)), 0644)
 		return nil
+	}
+	
+	// Verify output file exists and is complete
+	if !s.verifyScanCompletion(filepath.Join(outputDir, "6-udp.txt")) {
+		s.logWorker(workerID, ColorYellow, "UDP scan incomplete for %s", ip)
 	}
 	
 	ports := s.parsePorts(filepath.Join(outputDir, ".udp.gnmap"))
@@ -789,6 +887,9 @@ func (s *Scanner) udpScan(ip, outputDir string, workerID int) []string {
 func (s *Scanner) runCommandForWorker(cmd *exec.Cmd, desc string, timeout int, workerID int) error {
 	// Start the command
 	if err := cmd.Start(); err != nil {
+		if s.config.Verbose {
+			s.logWorker(workerID, ColorRed, "Failed to start command: %v", err)
+		}
 		return err
 	}
 	
@@ -804,6 +905,9 @@ func (s *Scanner) runCommandForWorker(cmd *exec.Cmd, desc string, timeout int, w
 		if err != nil {
 			if s.ctx.Err() != nil {
 				return fmt.Errorf("scan cancelled")
+			}
+			if s.config.Verbose {
+				s.logWorker(workerID, ColorRed, "Command failed: %v", err)
 			}
 			return err
 		}
@@ -835,7 +939,7 @@ func (s *Scanner) checkFTPForWorker(ip, outputDir string, workerID int) {
 	cmd := exec.CommandContext(s.ctx, "nmap", "-p21", "--script=ftp-anon,ftp-syst,ftp-bounce",
 		"-T3", ip, "-oN", filepath.Join(outputDir, "ftp-detailed.txt"))
 	
-	if err := cmd.Run(); err == nil {
+	if err := s.runCommandForWorker(cmd, "Checking FTP anonymous access", 30, workerID); err == nil {
 		if data, err := os.ReadFile(filepath.Join(outputDir, "ftp-detailed.txt")); err == nil {
 			if strings.Contains(string(data), "Anonymous FTP login allowed") {
 				s.logWorker(workerID, ColorRed, "ANONYMOUS FTP LOGIN ALLOWED on %s!", ip)
@@ -852,6 +956,9 @@ func (s *Scanner) parsePorts(grepFile string) []string {
 	
 	file, err := os.Open(grepFile)
 	if err != nil {
+		if s.config.Verbose {
+			fmt.Printf("%s[DEBUG] Failed to open grep file %s: %v%s\n", ColorGray, grepFile, err, ColorReset)
+		}
 		return ports
 	}
 	defer file.Close()
@@ -879,21 +986,95 @@ func (s *Scanner) parsePorts(grepFile string) []string {
 func (s *Scanner) parseServices(serviceFile string, result *Result) {
 	file, err := os.Open(serviceFile)
 	if err != nil {
+		if s.config.Verbose {
+			fmt.Printf("%s[DEBUG] Failed to open service file %s: %v%s\n", ColorGray, serviceFile, err, ColorReset)
+		}
 		return
 	}
 	defer file.Close()
 	
 	scanner := bufio.NewScanner(file)
+	// Match port/protocol, state, service name, and version info
 	re := regexp.MustCompile(`^(\d+)/tcp\s+open\s+(\S+)\s*(.*)`)
 	
 	for scanner.Scan() {
 		line := scanner.Text()
+		
 		if matches := re.FindStringSubmatch(line); len(matches) > 0 {
 			port := matches[1]
 			service := matches[2]
-			version := strings.TrimSpace(matches[3])
+			versionInfo := strings.TrimSpace(matches[3])
 			
-			result.Services[port] = fmt.Sprintf("%s %s", service, version)
+			// Build the full service string
+			fullService := service
+			if versionInfo != "" {
+				// Remove syn-ack, ttl, and other network flags
+				versionInfo = regexp.MustCompile(`\s*(syn-ack|ttl \d+)\s*`).ReplaceAllString(versionInfo, " ")
+				versionInfo = strings.TrimSpace(versionInfo)
+				if versionInfo != "" {
+					fullService = service + " " + versionInfo
+				}
+			}
+			
+			result.Services[port] = fullService
+			
+			if s.config.Verbose {
+				fmt.Printf("%s[DEBUG] Parsed - Port: %s, Service: %s%s\n", 
+					ColorGray, port, fullService, ColorReset)
+			}
+		}
+	}
+}
+
+// Clean service string for display
+func (s *Scanner) cleanServiceString(service string) string {
+	// Remove network flags and script output
+	service = regexp.MustCompile(`\s*(syn-ack|ttl \d+)\s*`).ReplaceAllString(service, " ")
+	
+	// Find the main service info before any script output
+	if idx := strings.Index(service, "|"); idx > 0 {
+		service = service[:idx]
+	}
+	
+	// Clean up multiple spaces
+	service = regexp.MustCompile(`\s+`).ReplaceAllString(service, " ")
+	
+	return strings.TrimSpace(service)
+}
+
+// Additional parsing method for when the standard parsing fails
+func (s *Scanner) parseServicesVerbose(content string, result *Result, ports []string) {
+	lines := strings.Split(content, "\n")
+	
+	for _, port := range ports {
+		// Look for any line containing the port number
+		portPattern := fmt.Sprintf(`%s/tcp\s+open\s+(\S+)`, port)
+		re := regexp.MustCompile(portPattern)
+		
+		for _, line := range lines {
+			if matches := re.FindStringSubmatch(line); len(matches) > 0 {
+				service := matches[1]
+				// Look for version info in the same or next lines
+				version := ""
+				for i, vline := range lines {
+					if vline == line && i+1 < len(lines) {
+						// Check next line for version info
+						nextLine := lines[i+1]
+						if !strings.Contains(nextLine, "/tcp") && strings.TrimSpace(nextLine) != "" {
+							version = strings.TrimSpace(nextLine)
+						}
+					}
+				}
+				
+				if _, exists := result.Services[port]; !exists {
+					result.Services[port] = fmt.Sprintf("%s %s", service, version)
+				}
+			}
+		}
+		
+		// If still no service found, mark as unknown
+		if _, exists := result.Services[port]; !exists {
+			result.Services[port] = "unknown"
 		}
 	}
 }
@@ -903,6 +1084,9 @@ func (s *Scanner) parseVulns(vulnFile string) []string {
 	
 	data, err := os.ReadFile(vulnFile)
 	if err != nil {
+		if s.config.Verbose {
+			fmt.Printf("%s[DEBUG] Failed to read vuln file %s: %v%s\n", ColorGray, vulnFile, err, ColorReset)
+		}
 		return vulns
 	}
 	
@@ -935,6 +1119,16 @@ func (s *Scanner) canUseSudo() bool {
 	return cmd.Run() == nil
 }
 
+func (s *Scanner) verifyScanCompletion(filename string) bool {
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return false
+	}
+	
+	content := string(data)
+	return strings.Contains(content, "Nmap done") || strings.Contains(content, "# Nmap done")
+}
+
 func (s *Scanner) createSummary(ip, outputDir string, result *Result) {
 	summaryFile := filepath.Join(outputDir, "summary.txt")
 	file, err := os.Create(summaryFile)
@@ -947,25 +1141,90 @@ func (s *Scanner) createSummary(ip, outputDir string, result *Result) {
 	fmt.Fprintf(file, "=========================\n")
 	fmt.Fprintf(file, "Date: %s\n\n", time.Now().Format("2006-01-02 15:04:05"))
 	
-	fmt.Fprintf(file, "TCP Ports: %s\n", strings.Join(result.TCPPorts, ","))
-	fmt.Fprintf(file, "UDP Ports: %s\n\n", strings.Join(result.UDPPorts, ","))
+	if len(result.TCPPorts) > 0 {
+		fmt.Fprintf(file, "TCP Ports: %s\n", strings.Join(result.TCPPorts, ","))
+	} else {
+		fmt.Fprintf(file, "TCP Ports: None found\n")
+	}
+	
+	if len(result.UDPPorts) > 0 {
+		fmt.Fprintf(file, "UDP Ports: %s\n\n", strings.Join(result.UDPPorts, ","))
+	} else {
+		fmt.Fprintf(file, "UDP Ports: None found\n\n")
+	}
 	
 	// Check for critical findings
+	anonymousFTP := false
 	for port, service := range result.Services {
-		if port == "21" && strings.Contains(service, "Anonymous") {
-			fmt.Fprintf(file, "CRITICAL FINDING: Anonymous FTP access allowed!\n\n")
-			break
+		if port == "21" && (strings.Contains(strings.ToLower(service), "ftp") || strings.Contains(strings.ToLower(service), "vsftpd")) {
+			// Check the actual service scan file for anonymous FTP
+			servicesFile := filepath.Join(outputDir, "3-services.txt")
+			if data, err := os.ReadFile(servicesFile); err == nil {
+				if strings.Contains(string(data), "Anonymous FTP login allowed") {
+					fmt.Fprintf(file, "CRITICAL FINDING: Anonymous FTP access allowed!\n\n")
+					anonymousFTP = true
+					break
+				}
+			}
 		}
 	}
 	
-	fmt.Fprintf(file, "Services:\n")
-	for port, service := range result.Services {
-		fmt.Fprintf(file, "  %s/tcp: %s\n", port, service)
+	if len(result.Services) > 0 {
+		fmt.Fprintf(file, "Services:\n")
+		for port, service := range result.Services {
+			// Clean up service string for summary
+			serviceParts := strings.Fields(service)
+			cleanService := service
+			if len(serviceParts) > 0 {
+				cleanService = serviceParts[0]
+				// Add version if it's not a flag
+				for i := 1; i < len(serviceParts) && i < 3; i++ {
+					if !strings.Contains(serviceParts[i], "syn-ack") && 
+					   !strings.Contains(serviceParts[i], "ttl") &&
+					   !strings.HasPrefix(serviceParts[i], "|") {
+						cleanService += " " + serviceParts[i]
+					} else {
+						break
+					}
+				}
+			}
+			fmt.Fprintf(file, "  %s/tcp: %s\n", port, cleanService)
+		}
+	} else {
+		fmt.Fprintf(file, "Services: No services identified\n")
 	}
 	
 	if len(result.Vulns) > 0 {
-		fmt.Fprintf(file, "\nVULNERABILITIES DETECTED - See 4-vulns.txt\n")
+		fmt.Fprintf(file, "\nVULNERABILITIES DETECTED:\n")
+		for _, vuln := range result.Vulns {
+			fmt.Fprintf(file, "  - %s\n", vuln)
+		}
+	} else {
+		fmt.Fprintf(file, "\nVulnerabilities: None detected\n")
 	}
+	
+	// Add scan recommendations
+	fmt.Fprintf(file, "\n\nNext Steps:\n")
+	if len(result.TCPPorts) > 0 {
+		for _, port := range result.TCPPorts {
+			switch port {
+			case "80", "443", "8080", "8443":
+				fmt.Fprintf(file, "- Web enumeration on port %s: gobuster dir -u http://%s:%s -w /usr/share/wordlists/dirb/common.txt\n", port, ip, port)
+			case "445":
+				fmt.Fprintf(file, "- SMB enumeration: enum4linux -a %s\n", ip)
+			case "21":
+				if !anonymousFTP {
+					fmt.Fprintf(file, "- FTP brute force: hydra -L users.txt -P passwords.txt ftp://%s\n", ip)
+				} else {
+					fmt.Fprintf(file, "- FTP anonymous access: ftp %s (user: anonymous)\n", ip)
+				}
+			case "22":
+				fmt.Fprintf(file, "- SSH brute force (if needed): hydra -L users.txt -P passwords.txt ssh://%s\n", ip)
+			}
+		}
+	}
+	
+	fmt.Fprintf(file, "\nFor detailed service information, check 3-services.txt\n")
 }
 
 // Utility functions
@@ -1079,6 +1338,23 @@ func detectVPNInterface() string {
 	return "tun0" // Default
 }
 
+func getDifference(slice1, slice2 []string) []string {
+	diff := []string{}
+	m := make(map[string]bool)
+	
+	for _, item := range slice2 {
+		m[item] = true
+	}
+	
+	for _, item := range slice1 {
+		if !m[item] {
+			diff = append(diff, item)
+		}
+	}
+	
+	return diff
+}
+
 // Network monitoring helper functions
 func getActiveConnections(ip string) int {
 	// Use ss to count established connections to the target IP
@@ -1116,6 +1392,8 @@ func shortenIP(ip string) string {
 		// If in same subnet, just show last octet
 		if strings.HasPrefix(ip, "10.10.10.") {
 			return "10." + parts[3]
+		} else if strings.HasPrefix(ip, "10.11.") {
+			return parts[2] + "." + parts[3]
 		} else if strings.HasPrefix(ip, "192.168.") {
 			return parts[2] + "." + parts[3]
 		}
@@ -1238,11 +1516,29 @@ func printSummary(scanner *Scanner, targets []string, duration time.Duration) {
 	// Show hosts with findings
 	hostsWithPorts := 0
 	hostsWithVulns := 0
+	hostsWithWebPorts := []string{}
+	hostsWithSMB := []string{}
 	
 	scanner.results.Range(func(key, value interface{}) bool {
 		if result, ok := value.(*Result); ok {
 			if len(result.TCPPorts) > 0 || len(result.UDPPorts) > 0 {
 				hostsWithPorts++
+				
+				// Check for web ports
+				for _, port := range result.TCPPorts {
+					if port == "80" || port == "443" || port == "8080" || port == "8443" {
+						hostsWithWebPorts = append(hostsWithWebPorts, result.IP)
+						break
+					}
+				}
+				
+				// Check for SMB
+				for _, port := range result.TCPPorts {
+					if port == "445" || port == "139" {
+						hostsWithSMB = append(hostsWithSMB, result.IP)
+						break
+					}
+				}
 			}
 			if len(result.Vulns) > 0 {
 				hostsWithVulns++
@@ -1256,5 +1552,13 @@ func printSummary(scanner *Scanner, targets []string, duration time.Duration) {
 		fmt.Printf("Hosts with vulnerabilities: %s%d%s\n", ColorRed, hostsWithVulns, ColorReset)
 	}
 	
-	fmt.Printf("\n%s[✓] Results saved in %s%s\n", ColorGreen, scanner.config.OutputDir, ColorReset)
+	if len(hostsWithWebPorts) > 0 {
+		fmt.Printf("\n%sWeb servers found on:%s %s\n", ColorCyan, ColorReset, strings.Join(hostsWithWebPorts, ", "))
+	}
+	
+	if len(hostsWithSMB) > 0 {
+		fmt.Printf("%sSMB servers found on:%s %s\n", ColorCyan, ColorReset, strings.Join(hostsWithSMB, ", "))
+	}
+	
+	fmt.Printf("\n%s[+] Results saved in %s%s\n", ColorGreen, scanner.config.OutputDir, ColorReset)
 }
