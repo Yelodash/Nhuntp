@@ -680,7 +680,7 @@ func (s *Scanner) fastTCPScan(ip, outputDir string, workerID int) []string {
 }
 
 func (s *Scanner) fullPortScan(ip, outputDir string, workerID int) []string {
-	cmd := exec.CommandContext(s.ctx, "nmap", "-p-", "--min-rate=2000", "--max-retries=1",
+	cmd := exec.CommandContext(s.ctx, "nmap", "-p-", "--min-rate=2000", "--max-retries=2",
 		"-T4", "-Pn", "--open",
 		"-oN", filepath.Join(outputDir, "2-full-ports.txt"),
 		"-oG", filepath.Join(outputDir, ".full-port.gnmap"),
