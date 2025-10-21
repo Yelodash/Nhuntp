@@ -8,11 +8,9 @@ usage
 # Compile for current system
 go build -o nhuntp nhuntp.go
 
-# Cross-compile for Linux (from any OS)
-GOOS=linux GOARCH=amd64 go build -o nhuntp nhuntp.go
-
-# Strip debug info for smaller binary (~8MB)
-go build -ldflags="-s -w" -o nhuntp nhuntp.go
+#paste to binaries for easier use
+chmod +x nhuntp
+cp nhuntp /usr/local/bin/
 ```
 
 ```
