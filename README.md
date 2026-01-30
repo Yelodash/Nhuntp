@@ -1,8 +1,9 @@
+----
 # Nhuntp
-
+---
 Scanner using nmap command chaining, clean output and only using Nmap.
 
-usage
+### Usage:
 
 ```
 # Compile for current system
@@ -12,7 +13,7 @@ go build -o nhuntp nhuntp.go
 chmod +x nhuntp
 cp nhuntp /usr/local/bin/
 ```
-
+----
 ```
 # Single IP
 ./nhuntp -t 10.10.10.5
@@ -30,8 +31,9 @@ cp nhuntp /usr/local/bin/
 ./nhuntp -t 10.10.10.0/24 -gw 10.10.10.1
 ```
 
-output structure:
+### Output structure:
 
+----
 ```
 output_dir/
 ├── nmap-10.10.10.5/
